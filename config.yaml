@@ -1,0 +1,52 @@
+# Intervallo di polling in secondi
+polling_interval: 300  # 5 minuti
+
+# Soglia minima di margine per notificare (percentuale)
+min_margin_percent: 25
+
+# Numero massimo di inserzioni da processare per ciclo per piattaforma
+max_listings_per_cycle: 50
+
+# Piattaforme attive
+platforms:
+  - subito
+  # - vinted      # decommentare quando pronto
+  # - wallapop    # decommentare quando pronto
+  # - ebay        # decommentare quando pronto
+
+# Categorie da monitorare
+categories:
+  - name: "Smartphone"
+    keywords:
+      - "iphone"
+      - "samsung galaxy"
+      - "pixel"
+    min_price: 50
+    max_price: 1200
+
+  - name: "Console"
+    keywords:
+      - "ps5"
+      - "playstation 5"
+      - "xbox series"
+      - "nintendo switch"
+    min_price: 100
+    max_price: 600
+
+# Configurazione LLM
+llm:
+  model: "claude-haiku-4-5-20251001"
+  max_tokens: 500
+  temperature: 0
+
+# Configurazione prezzo
+pricing:
+  ebay_sold_items_count: 20
+  use_median: true
+  max_days_sold: 30
+
+# Notifiche
+notifications:
+  telegram:
+    enabled: true
+    include_image: true
