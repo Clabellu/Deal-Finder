@@ -1,9 +1,10 @@
-"""Debug: scarica una pagina Subito.it e analizza la struttura HTML."""
+"""Debug: scarica una pagina Subito.it e analizza la struttura HTML/JSON."""
 
 import asyncio
 import json
 import re
 
+from bs4 import BeautifulSoup
 from curl_cffi.requests import AsyncSession
 
 
@@ -47,103 +48,116 @@ async def main():
             f.write(html)
         print("   HTML salvato in debug_subito.html")
 
-        # Analisi struttura
-        print("\n3. Analisi struttura HTML:")
-
-        # Check __NEXT_DATA__
+        # ── ANALISI __NEXT_DATA__ ──
+        print("\n3. Analisi __NEXT_DATA__:")
         match = re.search(
             r'<script\s+id="__NEXT_DATA__"\s+type="application/json"[^>]*>(.*?)</script>',
             html, re.DOTALL,
         )
-        if match:
-            print(f"   [TROVATO] __NEXT_DATA__: {len(match.group(1))} chars")
-            try:
-                data = json.loads(match.group(1))
-                # Cerca "ads" ricorsivamente
-                ads = _dig_for_key(data, "ads")
-                if ads is not None:
-                    print(f"   [TROVATO] ads array: {len(ads)} elementi")
-                    if ads:
-                        print(f"   Primo annuncio keys: {list(ads[0].keys()) if isinstance(ads[0], dict) else type(ads[0])}")
-                else:
-                    print("   [MANCANTE] nessun array 'ads' nel JSON")
-                    # Mostra le chiavi top-level
-                    print(f"   Chiavi top-level: {list(data.keys())}")
-                    if "props" in data:
-                        props = data["props"]
-                        print(f"   props keys: {list(props.keys()) if isinstance(props, dict) else type(props)}")
-                        if "pageProps" in props:
-                            pp = props["pageProps"]
-                            print(f"   pageProps keys: {list(pp.keys()) if isinstance(pp, dict) else type(pp)}")
-                            # Cerca tutte le chiavi che contengono "ad" o "list" o "item"
-                            interesting = [k for k in pp.keys() if any(w in k.lower() for w in ["ad", "list", "item", "result", "search"])]
-                            if interesting:
-                                print(f"   Chiavi interessanti in pageProps: {interesting}")
-                                for k in interesting:
-                                    v = pp[k]
-                                    if isinstance(v, list):
-                                        print(f"     {k}: lista con {len(v)} elementi")
-                                    elif isinstance(v, dict):
-                                        print(f"     {k}: dict con chiavi {list(v.keys())[:10]}")
-                                    else:
-                                        print(f"     {k}: {type(v).__name__}")
-            except json.JSONDecodeError as e:
-                print(f"   [ERRORE] JSON non valido: {e}")
-        else:
+        if not match:
             print("   [MANCANTE] __NEXT_DATA__ non trovato")
+            return
 
-        # Check JSON-LD
-        ld_matches = re.findall(
-            r'<script\s+type="application/ld\+json"[^>]*>(.*?)</script>', html, re.DOTALL
-        )
-        print(f"\n   JSON-LD trovati: {len(ld_matches)}")
-        for i, m in enumerate(ld_matches):
-            try:
-                ld = json.loads(m)
-                t = ld.get("@type", "unknown") if isinstance(ld, dict) else type(ld).__name__
-                print(f"   [{i}] @type={t}, keys={list(ld.keys())[:8] if isinstance(ld, dict) else 'N/A'}")
-            except json.JSONDecodeError:
-                print(f"   [{i}] JSON non valido")
+        print(f"   Trovato: {len(match.group(1))} chars")
+        data = json.loads(match.group(1))
 
-        # Check script tags con "ads"
-        scripts_with_ads = []
-        for m in re.finditer(r'<script[^>]*>(.*?)</script>', html, re.DOTALL):
-            if '"ads"' in m.group(1):
-                scripts_with_ads.append(m.group(1)[:200])
-        print(f"\n   Script con 'ads': {len(scripts_with_ads)}")
-        for i, s in enumerate(scripts_with_ads[:3]):
-            print(f"   [{i}] {s[:150]}...")
+        # Naviga in initialState
+        pp = data.get("props", {}).get("pageProps", {})
+        initial_state = pp.get("initialState", {})
+        print(f"\n   initialState keys: {list(initial_state.keys())}")
 
-        # Check links to .htm
-        htm_links = re.findall(r'href="[^"]*subito\.it/[^"]*\.htm"', html)
-        print(f"\n   Link .htm trovati: {len(htm_links)}")
-        for link in htm_links[:5]:
-            print(f"   {link[:120]}")
+        # Esplora ogni chiave di initialState
+        for key, value in initial_state.items():
+            if isinstance(value, dict):
+                print(f"\n   initialState.{key}: dict con {len(value)} chiavi")
+                print(f"     chiavi: {list(value.keys())[:15]}")
+                # Cerca liste che sembrano annunci
+                for k2, v2 in value.items():
+                    if isinstance(v2, list) and len(v2) > 0:
+                        print(f"     .{k2}: lista con {len(v2)} elementi")
+                        if isinstance(v2[0], dict):
+                            print(f"       primo elemento keys: {list(v2[0].keys())[:15]}")
+                            # Mostra un annuncio di esempio
+                            sample = v2[0]
+                            for sk in ["subject", "title", "name", "urn", "id", "url", "price"]:
+                                if sk in sample:
+                                    val = sample[sk]
+                                    if isinstance(val, str) and len(val) > 100:
+                                        val = val[:100] + "..."
+                                    print(f"       .{sk} = {val}")
+                    elif isinstance(v2, dict):
+                        inner_lists = {k3: len(v3) for k3, v3 in v2.items() if isinstance(v3, list) and len(v3) > 2}
+                        if inner_lists:
+                            print(f"     .{k2}: dict con liste: {inner_lists}")
+                            # Esplora la prima lista grande
+                            for k3, v3 in v2.items():
+                                if isinstance(v3, list) and len(v3) > 2:
+                                    if isinstance(v3[0], dict):
+                                        print(f"       .{k2}.{k3}[0] keys: {list(v3[0].keys())[:15]}")
+                                        sample = v3[0]
+                                        for sk in ["subject", "title", "name", "urn", "id", "url", "price", "features"]:
+                                            if sk in sample:
+                                                val = sample[sk]
+                                                if isinstance(val, str) and len(val) > 100:
+                                                    val = val[:100] + "..."
+                                                print(f"         .{sk} = {val}")
+                                    break
+            elif isinstance(value, list) and len(value) > 0:
+                print(f"\n   initialState.{key}: lista con {len(value)} elementi")
+                if isinstance(value[0], dict):
+                    print(f"     primo elemento keys: {list(value[0].keys())[:15]}")
 
-        # Check per pattern di prezzo
-        prices = re.findall(r'[\d.,]+\s*€|€\s*[\d.,]+', html)
-        print(f"\n   Pattern prezzo trovati: {len(prices)}")
-        for p in prices[:5]:
-            print(f"   {p}")
+        # Salva initialState come JSON leggibile
+        with open("debug_initialState.json", "w", encoding="utf-8") as f:
+            json.dump(initial_state, f, indent=2, ensure_ascii=False)
+        print("\n   initialState salvato in debug_initialState.json")
 
+        # ── TEST HTML PARSER ──
+        print("\n4. Test HTML parser (BeautifulSoup):")
+        soup = BeautifulSoup(html, "html.parser")
+        links = soup.find_all("a", href=re.compile(r"subito\.it/.+\.htm"))
+        print(f"   Link trovati da BS4: {len(links)}")
 
-def _dig_for_key(data, key, depth=0):
-    """Cerca ricorsivamente una chiave nel JSON."""
-    if depth > 10:
-        return None
-    if isinstance(data, dict):
-        if key in data and isinstance(data[key], list):
-            return data[key]
-        for v in data.values():
-            result = _dig_for_key(v, key, depth + 1)
-            if result is not None:
-                return result
-    elif isinstance(data, list):
-        for item in data:
-            result = _dig_for_key(item, key, depth + 1)
-            if result is not None:
-                return result
-    return None
+        # Prova a parsare i primi 3 link
+        for i, link in enumerate(links[:5]):
+            href = link.get("href", "")
+            id_match = re.search(r"/(\d+)\.htm", href)
+            if not id_match:
+                continue
+
+            print(f"\n   [{i}] {href[:80]}...")
+            print(f"       ID: {id_match.group(1)}")
+
+            # Titolo
+            title = ""
+            for tag in link.find_all(["h2", "h3", "span", "p"]):
+                text = tag.get_text(strip=True)
+                if len(text) > 10:
+                    title = text
+                    break
+            if not title:
+                title = link.get_text(strip=True)[:120]
+            print(f"       Titolo: '{title[:80]}'")
+
+            # Prezzo dentro al link
+            price_in_link = ""
+            for tag in link.find_all(["span", "p"], string=re.compile(r"[\d.,]+\s*€|€\s*[\d.,]+")):
+                price_in_link = tag.get_text()
+                break
+            print(f"       Prezzo in link: '{price_in_link}'")
+
+            # Prezzo nel parent
+            price_in_parent = ""
+            parent = link.parent
+            if parent:
+                for tag in parent.find_all(["span", "p"], string=re.compile(r"[\d.,]+\s*€|€\s*[\d.,]+")):
+                    price_in_parent = tag.get_text()
+                    break
+            print(f"       Prezzo in parent: '{price_in_parent}'")
+
+            # Mostra HTML del link (primi 500 chars)
+            link_html = str(link)
+            print(f"       HTML ({len(link_html)} chars): {link_html[:300]}...")
 
 
 if __name__ == "__main__":
