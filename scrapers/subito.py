@@ -174,7 +174,7 @@ class SubitoScraper(BaseScraper):
         if match:
             try:
                 next_data = json.loads(match.group(1))
-                ads = self._dig_for_ads(next_data)
+                ads = self._extract_ads_from_next_data(next_data)
                 if ads:
                     logger.debug("Estratti %d annunci da __NEXT_DATA__", len(ads))
                     for ad in ads:
@@ -224,20 +224,52 @@ class SubitoScraper(BaseScraper):
 
         return []
 
-    def _dig_for_ads(self, data, depth: int = 0) -> list:
-        """Cerca ricorsivamente una lista 'ads' nel JSON __NEXT_DATA__."""
+    def _extract_ads_from_next_data(self, data: dict) -> list:
+        """Estrae gli annunci dal JSON __NEXT_DATA__ di Subito.it.
+
+        Percorso attuale: props.pageProps.initialState.items.originalList
+        Fallback: cerca ricorsivamente 'ads' o 'originalList'.
+        """
+        # Percorso diretto (struttura attuale di Subito.it)
+        items = (
+            data.get("props", {})
+            .get("pageProps", {})
+            .get("initialState", {})
+            .get("items", {})
+        )
+        if isinstance(items, dict):
+            # originalList contiene gli annunci completi
+            original = items.get("originalList", [])
+            if original and isinstance(original, list):
+                logger.debug("Trovati %d annunci in initialState.items.originalList", len(original))
+                return original
+            # galleryList come alternativa
+            gallery = items.get("galleryList", [])
+            if gallery and isinstance(gallery, list):
+                logger.debug("Trovati %d annunci in initialState.items.galleryList", len(gallery))
+                return gallery
+
+        # Fallback: cerca ricorsivamente 'ads' o 'originalList'
+        for key in ("ads", "originalList"):
+            result = self._dig_for_key(data, key)
+            if result:
+                return result
+        return []
+
+    def _dig_for_key(self, data, key: str, depth: int = 0) -> list:
+        """Cerca ricorsivamente una lista con la chiave data nel JSON."""
         if depth > 8:
             return []
         if isinstance(data, dict):
-            if "ads" in data and isinstance(data["ads"], list) and len(data["ads"]) > 0:
-                return data["ads"]
+            if key in data and isinstance(data[key], list) and len(data[key]) > 0:
+                return data[key]
             for v in data.values():
-                result = self._dig_for_ads(v, depth + 1)
+                result = self._dig_for_key(v, key, depth + 1)
                 if result:
                     return result
         elif isinstance(data, list):
             for item in data:
-                result = self._dig_for_ads(item, depth + 1)
+                result = self._dig_for_key(item, key, depth + 1)
                 if result:
                     return result
         return []
@@ -305,9 +337,14 @@ class SubitoScraper(BaseScraper):
             else:
                 location = None
 
-            # Timestamp
-            dates = ad.get("dates", {})
-            timestamp = dates.get("display", datetime.now(timezone.utc).isoformat())
+            # Timestamp — il campo puo' essere "date" o "dates"
+            dates = ad.get("date", ad.get("dates", {}))
+            if isinstance(dates, str):
+                timestamp = dates
+            elif isinstance(dates, dict):
+                timestamp = dates.get("display", datetime.now(timezone.utc).isoformat())
+            else:
+                timestamp = datetime.now(timezone.utc).isoformat()
 
             return Listing(
                 id=listing_id,
