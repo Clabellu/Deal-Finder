@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from analyzer.llm_parser import LLMParser
 from analyzer.price_checker import PriceChecker
 from db.database import Database
+from notifier.bot_commands import BotController
 from notifier.telegram_bot import TelegramNotifier
 from scrapers.base_scraper import BaseScraper
 from scrapers.subito import SubitoScraper
@@ -44,6 +45,7 @@ async def run_cycle(
     parser: LLMParser,
     price_checker: PriceChecker,
     notifier: TelegramNotifier,
+    bot: BotController | None = None,
 ) -> None:
     """Esegue un ciclo completo di scraping, analisi e notifica."""
     min_margin = config.get("min_margin_percent", 25)
@@ -64,7 +66,7 @@ async def run_cycle(
             max_price = category.get("max_price", 99999)
 
             for keyword in keywords:
-                if _shutdown:
+                if _shutdown or (bot and bot.is_paused):
                     return
 
                 try:
@@ -82,7 +84,7 @@ async def run_cycle(
                 listings = listings[:max_listings]
 
                 for listing in listings:
-                    if _shutdown:
+                    if _shutdown or (bot and bot.is_paused):
                         return
 
                     # Controlla se gia' vista
@@ -234,6 +236,9 @@ async def main() -> None:
     # Inizializza notifier
     notifier = TelegramNotifier()
 
+    # Inizializza controller comandi Telegram
+    bot = BotController(db)
+
     polling_interval = config.get("polling_interval", 300)
     logger.info(
         "Configurazione: %d piattaforme, %d categorie, polling ogni %ds",
@@ -246,11 +251,30 @@ async def main() -> None:
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
+    # Avvia bot comandi Telegram
+    try:
+        await bot.start()
+    except Exception:
+        logger.exception("Errore avvio bot comandi (continuo senza comandi)")
+
     # Loop principale
+    cycle_count = 0
+    deals_found = 0
     try:
         while not _shutdown:
+            # Se in pausa, aspetta senza fare scraping
+            if bot.is_paused:
+                logger.info("Bot in pausa, in attesa di /resume...")
+                for _ in range(10):
+                    if _shutdown or not bot.is_paused:
+                        break
+                    await asyncio.sleep(1)
+                continue
+
             try:
-                await run_cycle(config, db, scrapers, parser, price_checker, notifier)
+                await run_cycle(config, db, scrapers, parser, price_checker, notifier, bot)
+                cycle_count += 1
+                bot.update_stats(cycle_count, deals_found)
             except Exception:
                 logger.exception("Errore nel ciclo principale")
 
@@ -262,12 +286,13 @@ async def main() -> None:
 
             if not _shutdown:
                 logger.info("Prossimo ciclo tra %d secondi", polling_interval)
-                # Attendi con controllo periodico per shutdown
+                # Attendi con controllo periodico per shutdown e pausa
                 for _ in range(polling_interval):
                     if _shutdown:
                         break
                     await asyncio.sleep(1)
     finally:
+        await bot.stop()
         await db.close()
         logger.info("Deal Finder arrestato")
 

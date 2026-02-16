@@ -102,6 +102,52 @@ class Database:
         )
         await self._db.commit()
 
+    async def get_stats(self) -> dict:
+        """Restituisce statistiche generali del database."""
+        assert self._db is not None
+        cursor = await self._db.execute("SELECT COUNT(*) FROM seen_listings")
+        total_seen = (await cursor.fetchone())[0]
+
+        cursor = await self._db.execute("SELECT COUNT(*) FROM notifications")
+        total_notified = (await cursor.fetchone())[0]
+
+        cursor = await self._db.execute(
+            "SELECT COUNT(*) FROM seen_listings WHERE first_seen > datetime('now', '-1 day')"
+        )
+        seen_today = (await cursor.fetchone())[0]
+
+        cursor = await self._db.execute(
+            "SELECT COUNT(*) FROM notifications WHERE notified_at > datetime('now', '-1 day')"
+        )
+        notified_today = (await cursor.fetchone())[0]
+
+        return {
+            "total_seen": total_seen,
+            "total_notified": total_notified,
+            "seen_today": seen_today,
+            "notified_today": notified_today,
+        }
+
+    async def get_recent_notifications(self, limit: int = 5) -> list[dict]:
+        """Restituisce le ultime N notifiche inviate."""
+        assert self._db is not None
+        cursor = await self._db.execute(
+            """SELECT product_name, asked_price, market_price, margin_percent, notified_at
+               FROM notifications ORDER BY notified_at DESC LIMIT ?""",
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+        return [
+            {
+                "product_name": r[0],
+                "asked_price": r[1],
+                "market_price": r[2],
+                "margin_percent": r[3],
+                "notified_at": r[4],
+            }
+            for r in rows
+        ]
+
     async def cleanup_old_records(self, days: int = 30) -> int:
         """Rimuove record piu' vecchi di N giorni. Restituisce il numero di righe eliminate."""
         assert self._db is not None
