@@ -1,36 +1,42 @@
 import asyncio
+import random
 import re
 from datetime import datetime, timezone
 from typing import Optional
-from urllib.parse import quote_plus
 
 import aiohttp
-from bs4 import BeautifulSoup
 
 from scrapers.base_scraper import BaseScraper, Listing
 from utils.logger import get_logger
 
 logger = get_logger("subito")
 
-# Headers realistici per evitare blocchi
+# API endpoint JSON di Subito (molto piu' affidabile dello scraping HTML)
+_API_URL = "https://hades.subito.it/v1/search/items"
+
+# Headers che simulano una richiesta XHR dal browser
 _HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
+        "Chrome/131.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": "application/json, text/plain, */*",
     "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Referer": "https://www.subito.it/",
+    "Origin": "https://www.subito.it",
+    "X-Requested-With": "XMLHttpRequest",
 }
 
-_BASE_URL = "https://www.subito.it/annunci-italia/vendita/usato/"
 _REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30)
-_DELAY_BETWEEN_PAGES = 2.0  # secondi tra una pagina e l'altra
+_ITEMS_PER_PAGE = 30
 _MAX_PAGES = 3
+_MAX_RETRIES = 3
+_BASE_DELAY = 2.0  # secondi base tra le pagine
 
 
 class SubitoScraper(BaseScraper):
-    """Scraper per Subito.it."""
+    """Scraper per Subito.it tramite API JSON interna."""
 
     @property
     def platform_name(self) -> str:
@@ -43,13 +49,13 @@ class SubitoScraper(BaseScraper):
         max_price: float,
         category_name: str,
     ) -> list[Listing]:
-        """Cerca inserzioni su Subito.it."""
+        """Cerca inserzioni su Subito.it via API JSON."""
         all_listings: list[Listing] = []
 
         async with aiohttp.ClientSession(
             headers=_HEADERS, timeout=_REQUEST_TIMEOUT
         ) as session:
-            for page in range(1, _MAX_PAGES + 1):
+            for page in range(_MAX_PAGES):
                 try:
                     listings = await self._fetch_page(
                         session, keyword, min_price, max_price, category_name, page
@@ -57,24 +63,29 @@ class SubitoScraper(BaseScraper):
                     if not listings:
                         logger.debug(
                             "Nessun risultato a pagina %d per '%s', stop paginazione",
-                            page,
+                            page + 1,
                             keyword,
                         )
                         break
                     all_listings.extend(listings)
                     logger.debug(
-                        "Pagina %d per '%s': %d inserzioni", page, keyword, len(listings)
+                        "Pagina %d per '%s': %d inserzioni",
+                        page + 1,
+                        keyword,
+                        len(listings),
                     )
                 except asyncio.CancelledError:
                     raise
                 except Exception:
                     logger.exception(
-                        "Errore scraping pagina %d per '%s'", page, keyword
+                        "Errore scraping pagina %d per '%s'", page + 1, keyword
                     )
                     break
 
-                if page < _MAX_PAGES:
-                    await asyncio.sleep(_DELAY_BETWEEN_PAGES)
+                if page < _MAX_PAGES - 1:
+                    # Delay randomizzato tra le pagine (2-4 secondi)
+                    delay = _BASE_DELAY + random.uniform(0, 2.0)
+                    await asyncio.sleep(delay)
 
         logger.info(
             "Subito: trovate %d inserzioni per '%s' [%s]",
@@ -93,133 +104,155 @@ class SubitoScraper(BaseScraper):
         category_name: str,
         page: int,
     ) -> list[Listing]:
-        """Scarica e parsa una singola pagina di risultati."""
+        """Scarica una pagina di risultati dall'API JSON con retry."""
         params = {
             "q": keyword,
+            "t": "s",  # solo vendita
+            "sort": "date",
+            "order": "desc",
             "ps": str(int(min_price)),
             "pe": str(int(max_price)),
-            "o": str(page),
+            "lim": str(_ITEMS_PER_PAGE),
+            "start": str(page * _ITEMS_PER_PAGE),
         }
-        url = _BASE_URL + "?" + "&".join(f"{k}={quote_plus(str(v))}" for k, v in params.items())
 
-        async with session.get(url) as resp:
-            if resp.status == 429:
-                logger.warning("Subito: rate limited (429), attendo prima di riprovare")
-                await asyncio.sleep(10)
-                return []
-            if resp.status != 200:
-                logger.warning("Subito: HTTP %d per url %s", resp.status, url)
-                return []
-            html = await resp.text()
+        for attempt in range(_MAX_RETRIES):
+            try:
+                async with session.get(_API_URL, params=params) as resp:
+                    if resp.status == 429:
+                        wait = (2 ** attempt) + random.uniform(0, 1)
+                        logger.warning(
+                            "Subito: rate limited (429), retry tra %.1fs", wait
+                        )
+                        await asyncio.sleep(wait)
+                        continue
 
-        return self._parse_listings(html, category_name)
+                    if resp.status == 403:
+                        wait = (2 ** attempt) + random.uniform(0, 1)
+                        logger.warning(
+                            "Subito: forbidden (403), retry tra %.1fs", wait
+                        )
+                        await asyncio.sleep(wait)
+                        continue
 
-    def _parse_listings(self, html: str, category_name: str) -> list[Listing]:
-        """Parsa l'HTML di Subito.it ed estrae le inserzioni."""
-        soup = BeautifulSoup(html, "html.parser")
+                    if resp.status != 200:
+                        logger.warning(
+                            "Subito: HTTP %d per query '%s'", resp.status, keyword
+                        )
+                        return []
+
+                    data = await resp.json()
+                    return self._parse_api_response(data, category_name)
+
+            except aiohttp.ClientError as e:
+                if attempt < _MAX_RETRIES - 1:
+                    wait = (2 ** attempt) + random.uniform(0, 1)
+                    logger.warning("Subito: errore rete, retry tra %.1fs: %s", wait, e)
+                    await asyncio.sleep(wait)
+                else:
+                    raise
+
+        logger.warning("Subito: tentativi esauriti per query '%s'", keyword)
+        return []
+
+    def _parse_api_response(self, data: dict, category_name: str) -> list[Listing]:
+        """Parsa la risposta JSON dell'API Subito."""
         listings: list[Listing] = []
+        ads = data.get("ads", [])
 
-        # Subito usa un div con classe che contiene "items" per le card
-        # Cerchiamo i link agli annunci
-        items = soup.select("div.items__item, div[class*='ItemCard'], a[class*='SmallCard']")
-
-        if not items:
-            # Fallback: cerchiamo tutti i link che puntano ad annunci
-            items = soup.find_all("a", href=re.compile(r"subito\.it/.+\.htm"))
-
-        for item in items:
-            listing = self._parse_single_item(item, category_name)
+        for ad in ads:
+            listing = self._parse_ad(ad, category_name)
             if listing:
                 listings.append(listing)
 
         return listings
 
-    def _parse_single_item(self, item, category_name: str) -> Optional[Listing]:
-        """Parsa un singolo elemento della lista risultati."""
+    def _parse_ad(self, ad: dict, category_name: str) -> Optional[Listing]:
+        """Converte un singolo annuncio dall'API JSON in un Listing."""
         try:
-            # Estrai URL
-            if item.name == "a":
-                url = item.get("href", "")
-            else:
-                link = item.find("a", href=True)
-                url = link["href"] if link else ""
-
-            if not url or "subito.it" not in url:
+            # ID annuncio
+            urn = ad.get("urn", "")
+            # urn formato: "subito:ad:123456"
+            listing_id = urn.split(":")[-1] if urn else ""
+            if not listing_id:
                 return None
 
-            if not url.startswith("http"):
-                url = "https://www.subito.it" + url
-
-            # Estrai ID dall'URL (es. /annuncio/12345.htm -> 12345)
-            id_match = re.search(r"/(\d+)\.htm", url)
-            if not id_match:
-                return None
-            listing_id = id_match.group(1)
-
-            # Estrai titolo
-            title_el = item.find(
-                ["h2", "h3", "span"],
-                class_=re.compile(r"(?i)(title|name|subject)", re.IGNORECASE),
-            )
-            title = title_el.get_text(strip=True) if title_el else ""
-            if not title:
-                # Fallback: primo testo significativo
-                title = item.get_text(strip=True)[:120]
-
+            # Titolo
+            title = ad.get("subject", "").strip()
             if not title:
                 return None
 
-            # Estrai prezzo
-            price_el = item.find(
-                ["span", "p", "div"],
-                class_=re.compile(r"(?i)price", re.IGNORECASE),
-            )
-            price = self._extract_price(price_el.get_text() if price_el else "")
+            # Descrizione (body puo' essere assente nei risultati di ricerca)
+            description = ad.get("body", "")
+
+            # Prezzo
+            price_data = ad.get("features", [])
+            price = self._extract_price_from_features(price_data)
             if price is None:
                 return None
 
-            # Estrai immagine
-            img_el = item.find("img", src=True)
-            image_url = img_el.get("src") if img_el else None
-            if image_url and image_url.startswith("//"):
-                image_url = "https:" + image_url
+            # URL annuncio
+            urls = ad.get("urls", {})
+            url = urls.get("default", "")
+            if not url:
+                return None
 
-            # Estrai localita'
-            loc_el = item.find(
-                ["span", "p"],
-                class_=re.compile(r"(?i)(city|location|town|place)", re.IGNORECASE),
-            )
-            location = loc_el.get_text(strip=True) if loc_el else None
+            # Immagine
+            images = ad.get("images", [])
+            image_url = None
+            if images:
+                # Prendi la versione "big" della prima immagine
+                first_img = images[0] if isinstance(images[0], dict) else {}
+                image_url = (
+                    first_img.get("cdn_url")
+                    or first_img.get("base_url", "")
+                )
+                if image_url and "{size}" in image_url:
+                    image_url = image_url.replace("{size}", "big")
+
+            # Localita'
+            geo = ad.get("geo", {})
+            city = geo.get("city", {}).get("value", "")
+            region = geo.get("region", {}).get("value", "")
+            location = f"{city}, {region}".strip(", ") if city or region else None
+
+            # Timestamp pubblicazione
+            dates = ad.get("dates", {})
+            timestamp = dates.get("display", datetime.now(timezone.utc).isoformat())
 
             return Listing(
                 id=listing_id,
                 platform="subito",
                 title=title,
-                description="",  # La descrizione completa richiede una visita alla pagina
+                description=description,
                 price=price,
                 currency="EUR",
                 url=url,
                 image_url=image_url,
                 location=location,
                 category_matched=category_name,
-                timestamp=datetime.now(timezone.utc).isoformat(),
+                timestamp=timestamp,
             )
         except Exception:
-            logger.debug("Errore parsing singolo item Subito", exc_info=True)
+            logger.debug("Errore parsing annuncio Subito", exc_info=True)
             return None
 
     @staticmethod
-    def _extract_price(text: str) -> Optional[float]:
-        """Estrae un prezzo numerico da una stringa (es. '€ 350' -> 350.0)."""
-        if not text:
-            return None
-        # Rimuovi tutto tranne cifre, virgola e punto
-        cleaned = re.sub(r"[^\d.,]", "", text)
-        if not cleaned:
-            return None
-        # Gestisci formato italiano (1.200,00 o 350)
-        cleaned = cleaned.replace(".", "").replace(",", ".")
-        try:
-            return float(cleaned)
-        except ValueError:
-            return None
+    def _extract_price_from_features(features: list) -> Optional[float]:
+        """Estrae il prezzo dalla lista features dell'API."""
+        for feature in features:
+            uri = feature.get("uri", "")
+            if "/price" in uri:
+                values = feature.get("values", [])
+                if values:
+                    raw = values[0].get("value", "")
+                    # Il valore puo' essere "450" oppure "450,00"
+                    cleaned = re.sub(r"[^\d.,]", "", str(raw))
+                    if not cleaned:
+                        return None
+                    cleaned = cleaned.replace(".", "").replace(",", ".")
+                    try:
+                        return float(cleaned)
+                    except ValueError:
+                        return None
+        return None

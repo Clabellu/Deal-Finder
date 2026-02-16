@@ -122,12 +122,11 @@ async def test_subito_scraper():
             max_price=800,
             category_name="Smartphone",
         )
-        print(f"{PASS} Scraper Subito funzionante: trovati {len(listings)} annunci")
-        if listings:
-            first = listings[0]
-            print(f"     Esempio: \"{first.title}\" - {first.price}EUR")
-            print(f"     URL: {first.url}")
-        else:
+        print(f"{PASS} Scraper Subito (API JSON): trovati {len(listings)} annunci")
+        for i, l in enumerate(listings[:3]):
+            loc = l.location or "N/A"
+            print(f"     {i+1}. \"{l.title}\" - {l.price}EUR ({loc})")
+        if not listings:
             print("     (nessun risultato, ma la connessione funziona)")
         return True
     except Exception as e:
