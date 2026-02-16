@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import quote_plus
 
-import aiohttp
+from curl_cffi.requests import AsyncSession
 from bs4 import BeautifulSoup
 
 from scrapers.base_scraper import BaseScraper, Listing
@@ -18,21 +18,12 @@ _SEARCH_URL = "https://www.subito.it/annunci-italia/vendita/usato/"
 
 # Headers realistici - browser standard
 _HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/131.0.0.0 Safari/537.36"
-    ),
     "Accept": (
         "text/html,application/xhtml+xml,application/xml;"
         "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
     ),
     "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept-Encoding": "gzip, deflate, br",
     "Cache-Control": "no-cache",
-    "Sec-Ch-Ua": '"Chromium";v="131", "Not_A Brand";v="24"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
     "Sec-Fetch-Dest": "document",
     "Sec-Fetch-Mode": "navigate",
     "Sec-Fetch-Site": "none",
@@ -40,14 +31,17 @@ _HEADERS = {
     "Upgrade-Insecure-Requests": "1",
 }
 
-_REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30)
+_REQUEST_TIMEOUT = 30
 _MAX_PAGES = 3
 _MAX_RETRIES = 3
 _BASE_DELAY = 2.0
 
+# curl_cffi impersona il fingerprint TLS di Chrome 131
+_IMPERSONATE = "chrome131"
+
 
 class SubitoScraper(BaseScraper):
-    """Scraper per Subito.it con estrazione dati JSON embedded nella pagina HTML."""
+    """Scraper per Subito.it con curl_cffi (TLS fingerprint di Chrome)."""
 
     @property
     def platform_name(self) -> str:
@@ -63,15 +57,15 @@ class SubitoScraper(BaseScraper):
         """Cerca inserzioni su Subito.it."""
         all_listings: list[Listing] = []
 
-        jar = aiohttp.CookieJar()
-        async with aiohttp.ClientSession(
-            headers=_HEADERS, timeout=_REQUEST_TIMEOUT, cookie_jar=jar
+        async with AsyncSession(
+            headers=_HEADERS,
+            impersonate=_IMPERSONATE,
+            timeout=_REQUEST_TIMEOUT,
         ) as session:
             # Warm-up: visita homepage per ottenere cookies
             try:
-                async with session.get("https://www.subito.it/") as resp:
-                    await resp.read()
-                    logger.debug("Warm-up homepage: HTTP %d, cookies: %d", resp.status, len(jar))
+                resp = await session.get("https://www.subito.it/")
+                logger.debug("Warm-up homepage: HTTP %d", resp.status_code)
                 await asyncio.sleep(random.uniform(1.0, 2.0))
             except Exception:
                 logger.debug("Warm-up homepage fallito, continuo comunque")
@@ -109,7 +103,7 @@ class SubitoScraper(BaseScraper):
 
     async def _fetch_page(
         self,
-        session: aiohttp.ClientSession,
+        session: AsyncSession,
         keyword: str,
         min_price: float,
         max_price: float,
@@ -120,28 +114,30 @@ class SubitoScraper(BaseScraper):
         params = f"q={quote_plus(keyword)}&ps={int(min_price)}&pe={int(max_price)}&o={page}"
         url = f"{_SEARCH_URL}?{params}"
 
+        html = None
         for attempt in range(_MAX_RETRIES):
             try:
-                async with session.get(url) as resp:
-                    if resp.status == 429:
-                        wait = (2 ** attempt) + random.uniform(0, 1)
-                        logger.warning("Subito: rate limited (429), retry tra %.1fs", wait)
-                        await asyncio.sleep(wait)
-                        continue
+                resp = await session.get(url)
 
-                    if resp.status == 403:
-                        wait = (2 ** attempt) + random.uniform(0, 1)
-                        logger.warning("Subito: forbidden (403), retry tra %.1fs", wait)
-                        await asyncio.sleep(wait)
-                        continue
+                if resp.status_code == 429:
+                    wait = (2 ** attempt) + random.uniform(0, 1)
+                    logger.warning("Subito: rate limited (429), retry tra %.1fs", wait)
+                    await asyncio.sleep(wait)
+                    continue
 
-                    if resp.status != 200:
-                        logger.warning("Subito: HTTP %d per url %s", resp.status, url)
-                        return []
+                if resp.status_code == 403:
+                    wait = (2 ** attempt) + random.uniform(0, 1)
+                    logger.warning("Subito: forbidden (403), retry tra %.1fs", wait)
+                    await asyncio.sleep(wait)
+                    continue
 
-                    html = await resp.text()
+                if resp.status_code != 200:
+                    logger.warning("Subito: HTTP %d per url %s", resp.status_code, url)
+                    return []
 
-            except aiohttp.ClientError as e:
+                html = resp.text
+
+            except Exception as e:
                 if attempt < _MAX_RETRIES - 1:
                     wait = (2 ** attempt) + random.uniform(0, 1)
                     logger.warning("Subito: errore rete, retry tra %.1fs: %s", wait, e)
@@ -149,9 +145,14 @@ class SubitoScraper(BaseScraper):
                     continue
                 raise
 
+            # Richiesta riuscita, esci dal loop
+            break
         else:
             # Tutti i retry esauriti
             logger.warning("Subito: tentativi esauriti per '%s' pagina %d", keyword, page)
+            return []
+
+        if html is None:
             return []
 
         # Prova prima ad estrarre JSON embedded, poi fallback su HTML parsing
