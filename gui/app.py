@@ -53,6 +53,7 @@ class DealFinderApp(ctk.CTk):
         self.engine.on_status_change = self._on_engine_status
         self.engine.on_cycle_complete = self._on_cycle_complete
         self.engine.on_deal_found = self._on_deal_found
+        self.engine.on_listing_analyzed = self._on_listing_analyzed
         self.engine.on_log = self._on_engine_log
 
         self._build_layout()
@@ -82,6 +83,7 @@ class DealFinderApp(ctk.CTk):
         self._nav_buttons: dict[str, ctk.CTkButton] = {}
         nav_items = [
             ("dashboard", "Dashboard"),
+            ("analysis", "Analisi"),
             ("categories", "Categorie"),
             ("settings", "Impostazioni"),
             ("log", "Log"),
@@ -107,6 +109,7 @@ class DealFinderApp(ctk.CTk):
         # Frames
         self._frames: dict[str, ctk.CTkFrame] = {}
         self._frames["dashboard"] = self._build_dashboard_frame()
+        self._frames["analysis"] = self._build_analysis_frame()
         self._frames["categories"] = self._build_categories_frame()
         self._frames["settings"] = self._build_settings_frame()
         self._frames["log"] = self._build_log_frame()
@@ -213,6 +216,114 @@ class DealFinderApp(ctk.CTk):
                 lbl.grid(row=i + 1, column=j, padx=8, pady=3, sticky="w")
                 row_labels.append(lbl)
             self._deal_rows.append(row_labels)
+
+    # ── Analisi ──────────────────────────────────────────────
+
+    def _build_analysis_frame(self) -> ctk.CTkFrame:
+        frame = ctk.CTkFrame(self.main_container, fg_color="transparent")
+
+        header = ctk.CTkFrame(frame, fg_color="transparent")
+        header.pack(fill="x", pady=(0, 10))
+        ctk.CTkLabel(header, text="Analisi", font=ctk.CTkFont(size=24, weight="bold")).pack(side="left")
+
+        ctk.CTkButton(header, text="Pulisci", width=80, command=self._clear_analysis).pack(side="right")
+
+        # Legenda
+        legend = ctk.CTkFrame(frame, fg_color="transparent")
+        legend.pack(fill="x", pady=(0, 8))
+        legend_items = [
+            ("#2ea043", "DEAL"),
+            ("#d29922", "Sotto soglia"),
+            ("#8b949e", "No prezzo eBay"),
+            ("#d73a49", "Margine negativo"),
+        ]
+        for color, text in legend_items:
+            dot = ctk.CTkLabel(legend, text="\u25cf", text_color=color, font=ctk.CTkFont(size=14))
+            dot.pack(side="left", padx=(0, 2))
+            ctk.CTkLabel(legend, text=text, text_color="gray60", font=ctk.CTkFont(size=11)).pack(side="left", padx=(0, 12))
+
+        # Tabella
+        self.analysis_scroll = ctk.CTkScrollableFrame(frame)
+        self.analysis_scroll.pack(fill="both", expand=True)
+
+        # Configurazione colonne: Prodotto | Prezzo | eBay | Margine | Venduti | Stato
+        col_weights = [3, 1, 1, 1, 1, 1]
+        for i, w in enumerate(col_weights):
+            self.analysis_scroll.columnconfigure(i, weight=w)
+
+        headers = ["Prodotto", "Prezzo", "eBay", "Margine", "Venduti", "Stato"]
+        for i, h in enumerate(headers):
+            ctk.CTkLabel(
+                self.analysis_scroll, text=h,
+                font=ctk.CTkFont(size=12, weight="bold"), text_color="gray60",
+            ).grid(row=0, column=i, padx=6, pady=4, sticky="w")
+
+        self._analysis_rows: list[list[ctk.CTkLabel]] = []
+        self._analysis_row_count = 0
+
+        return frame
+
+    def _clear_analysis(self):
+        for row in self._analysis_rows:
+            for lbl in row:
+                lbl.destroy()
+        self._analysis_rows.clear()
+        self._analysis_row_count = 0
+
+    def _on_listing_analyzed(self, data: dict):
+        """Callback dal thread del motore per ogni inserzione analizzata."""
+        self.after(0, self._append_analysis_row, data)
+
+    def _append_analysis_row(self, data: dict):
+        self._analysis_row_count += 1
+        row_idx = self._analysis_row_count
+
+        status = data.get("status", "")
+        asked = data.get("asked_price", 0)
+        market = data.get("market_price", 0)
+        margin = data.get("margin_percent", 0)
+        sold = data.get("sold_count", 0)
+
+        # Determina colore e testo stato
+        status_map = {
+            "deal":         ("#2ea043", "DEAL"),
+            "sotto_soglia": ("#d29922", f"Sotto soglia"),
+            "no_prezzo":    ("#8b949e", "No prezzo"),
+            "errore_prezzo": ("#8b949e", "Errore prezzo"),
+            "skip_llm":     ("#6e7681", "Skip LLM"),
+            "errore_llm":   ("#6e7681", "Errore LLM"),
+        }
+        color, status_text = status_map.get(status, ("#8b949e", status))
+
+        # Margine negativo -> rosso
+        if market > 0 and margin < 0:
+            color = "#d73a49"
+
+        # Formatta valori
+        market_str = f"{market:.0f} EUR" if market > 0 else "—"
+        margin_str = f"{margin:+.0f}%" if market > 0 else "—"
+        sold_str = str(sold) if sold > 0 else "—"
+
+        values = [
+            data.get("product_name", "—")[:45],
+            f"{asked:.0f} EUR",
+            market_str,
+            margin_str,
+            sold_str,
+            status_text,
+        ]
+
+        row_labels = []
+        for j, val in enumerate(values):
+            text_color = color if j == 5 or (j == 3 and market > 0) else ("gray90", "gray90")
+            lbl = ctk.CTkLabel(
+                self.analysis_scroll, text=val,
+                font=ctk.CTkFont(size=12),
+                text_color=text_color,
+            )
+            lbl.grid(row=row_idx, column=j, padx=6, pady=2, sticky="w")
+            row_labels.append(lbl)
+        self._analysis_rows.append(row_labels)
 
     # ── Categorie ───────────────────────────────────────────
 

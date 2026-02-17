@@ -45,6 +45,7 @@ class MonitorEngine:
         self.on_status_change: Optional[Callable[[str], None]] = None
         self.on_cycle_complete: Optional[Callable[[dict], None]] = None
         self.on_deal_found: Optional[Callable[[dict], None]] = None
+        self.on_listing_analyzed: Optional[Callable[[dict], None]] = None
         self.on_log: Optional[Callable[[str], None]] = None
 
     @property
@@ -102,6 +103,29 @@ class MonitorEngine:
     def _emit_log(self, msg: str) -> None:
         if self.on_log:
             self.on_log(msg)
+
+    def _emit_analysis(
+        self,
+        product_name: str,
+        asked_price: float,
+        platform: str,
+        ebay_query: str = "",
+        market_price: float = 0,
+        margin_percent: float = 0,
+        sold_count: int = 0,
+        status: str = "",
+    ) -> None:
+        if self.on_listing_analyzed:
+            self.on_listing_analyzed({
+                "product_name": product_name,
+                "asked_price": asked_price,
+                "platform": platform,
+                "ebay_query": ebay_query,
+                "market_price": market_price,
+                "margin_percent": margin_percent,
+                "sold_count": sold_count,
+                "status": status,
+            })
 
     def _run_loop(self) -> None:
         """Entrypoint del thread: crea un event loop e avvia il ciclo async."""
@@ -270,9 +294,11 @@ class MonitorEngine:
                         try:
                             parsed = await parser.parse_listing(listing)
                         except Exception:
+                            self._emit_analysis(listing.title, listing.price, platform_name, status="errore_llm")
                             continue
 
                         if parsed is None:
+                            self._emit_analysis(listing.title, listing.price, platform_name, status="skip_llm")
                             continue
 
                         try:
@@ -280,9 +306,17 @@ class MonitorEngine:
                                 parsed.ebay_search_query, parsed.condition
                             )
                         except Exception:
+                            self._emit_analysis(
+                                parsed.product_name, listing.price, platform_name,
+                                ebay_query=parsed.ebay_search_query, status="errore_prezzo",
+                            )
                             continue
 
                         if price_result is None:
+                            self._emit_analysis(
+                                parsed.product_name, listing.price, platform_name,
+                                ebay_query=parsed.ebay_search_query, status="no_prezzo",
+                            )
                             continue
 
                         reference_price = price_result.median_price
@@ -290,7 +324,21 @@ class MonitorEngine:
                         margin_percent = (margin / listing.price * 100) if listing.price > 0 else 0
 
                         if margin_percent < min_margin:
+                            self._emit_analysis(
+                                parsed.product_name, listing.price, platform_name,
+                                ebay_query=parsed.ebay_search_query,
+                                market_price=reference_price, margin_percent=margin_percent,
+                                sold_count=price_result.sold_count, status="sotto_soglia",
+                            )
                             continue
+
+                        # DEAL trovato!
+                        self._emit_analysis(
+                            parsed.product_name, listing.price, platform_name,
+                            ebay_query=parsed.ebay_search_query,
+                            market_price=reference_price, margin_percent=margin_percent,
+                            sold_count=price_result.sold_count, status="deal",
+                        )
 
                         try:
                             sent = await notifier.send_deal(
