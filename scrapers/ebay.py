@@ -89,9 +89,10 @@ class EbayScraper(BaseScraper):
             "paginationInput.entriesPerPage": str(_ITEMS_PER_PAGE),
             "paginationInput.pageNumber": str(page),
             "sortOrder": "StartTimeNewest",
-            # Filtra solo eBay Italia
-            "GLOBAL-ID": "EBAY-IT",
         }
+
+        # Header per eBay Italia
+        headers = {"X-EBAY-SOA-GLOBAL-ID": "EBAY-IT"}
 
         # Filtro prezzo minimo
         params[f"itemFilter({filter_idx}).name"] = "MinPrice"
@@ -107,25 +108,22 @@ class EbayScraper(BaseScraper):
         params[f"itemFilter({filter_idx}).paramValue"] = "EUR"
         filter_idx += 1
 
-        # Solo inserzioni attive (Compralo Subito + Asta)
+        # Solo inserzioni attive (Compralo Subito + Asta con BIN)
         params[f"itemFilter({filter_idx}).name"] = "ListingType"
         params[f"itemFilter({filter_idx}).value(0)"] = "FixedPrice"
         params[f"itemFilter({filter_idx}).value(1)"] = "AuctionWithBIN"
-        filter_idx += 1
-
-        # Escludi inserzioni solo per ritiro locale (senza spedizione)
-        params[f"itemFilter({filter_idx}).name"] = "LocatedIn"
-        params[f"itemFilter({filter_idx}).value"] = "IT"
         filter_idx += 1
 
         try:
             async with session.get(
                 _FINDING_URL,
                 params=params,
+                headers=headers,
                 timeout=aiohttp.ClientTimeout(total=_REQUEST_TIMEOUT),
             ) as resp:
                 if resp.status != 200:
-                    logger.warning("eBay Finding API HTTP %d", resp.status)
+                    body = await resp.text()
+                    logger.warning("eBay Finding API HTTP %d: %s", resp.status, body[:300])
                     return []
                 data = await resp.json()
         except Exception:
