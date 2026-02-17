@@ -10,9 +10,9 @@ max_listings_per_cycle: 50
 # Piattaforme attive
 platforms:
   - subito
+  - ebay
   # - vinted      # decommentare quando pronto
   # - wallapop    # decommentare quando pronto
-  # - ebay        # decommentare quando pronto
 
 # Categorie da monitorare
 categories:

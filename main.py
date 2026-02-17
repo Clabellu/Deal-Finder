@@ -18,6 +18,7 @@ from notifier.bot_commands import BotController
 from notifier.telegram_bot import TelegramNotifier
 from scrapers.base_scraper import BaseScraper
 from scrapers.subito import SubitoScraper
+from scrapers.ebay import EbayScraper
 from utils.logger import setup_logger, get_logger
 
 load_dotenv()
@@ -27,6 +28,7 @@ logger = get_logger("main")
 # Mappa piattaforma -> classe scraper
 _SCRAPER_REGISTRY: dict[str, type[BaseScraper]] = {
     "subito": SubitoScraper,
+    "ebay": EbayScraper,
 }
 
 _shutdown = False

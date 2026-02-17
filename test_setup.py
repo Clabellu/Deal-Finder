@@ -135,15 +135,33 @@ async def test_subito_scraper():
 
 
 async def test_ebay():
-    """Controlla se le credenziali eBay sono configurate."""
-    print("\n--- Test eBay ---")
+    """Verifica che lo scraper eBay riesca a cercare tramite Finding API."""
+    print("\n--- Test eBay Scraper ---")
     app_id = os.environ.get("EBAY_APP_ID", "")
     if not app_id:
-        print("[SKIP] EBAY_APP_ID non configurato (in attesa di conferma account)")
-        print("       Potrai testarlo dopo con: python test_setup.py")
-        return None  # Skip, non fallimento
-    print(f"{PASS} EBAY_APP_ID trovato: {app_id[:15]}...")
-    return True
+        print("[SKIP] EBAY_APP_ID non configurato")
+        return None
+
+    try:
+        from scrapers.ebay import EbayScraper
+
+        scraper = EbayScraper()
+        listings = await scraper.search(
+            keyword="iphone 15",
+            min_price=400,
+            max_price=800,
+            category_name="Smartphone",
+        )
+        print(f"{PASS} Scraper eBay (Finding API): trovati {len(listings)} annunci")
+        for i, l in enumerate(listings[:3]):
+            loc = l.location or "N/A"
+            print(f"     {i+1}. \"{l.title}\" - {l.price}EUR ({loc})")
+        if not listings:
+            print("     (nessun risultato, ma la connessione funziona)")
+        return True
+    except Exception as e:
+        print(f"{FAIL} Errore scraper eBay: {e}")
+        return False
 
 
 async def main():
