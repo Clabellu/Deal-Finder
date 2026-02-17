@@ -23,20 +23,40 @@ _HEADERS = {
 
 
 def extract_price_from_features(features):
-    for feature in features:
-        uri = feature.get("uri", "")
-        if "/price" in uri:
-            values = feature.get("values", [])
-            if values:
-                raw = values[0].get("value", "")
-                cleaned = re.sub(r"[^\d.,]", "", str(raw))
-                if not cleaned:
-                    return None
-                cleaned = cleaned.replace(".", "").replace(",", ".")
-                try:
-                    return float(cleaned)
-                except ValueError:
-                    return None
+    # Formato dict (attuale): {"/price": {"values": [...]}}
+    if isinstance(features, dict):
+        for uri, feature in features.items():
+            if "/price" in uri and isinstance(feature, dict):
+                values = feature.get("values", [])
+                if values and isinstance(values[0], dict):
+                    raw = values[0].get("value", "")
+                    cleaned = re.sub(r"[^\d.,]", "", str(raw))
+                    if not cleaned:
+                        return None
+                    cleaned = cleaned.replace(".", "").replace(",", ".")
+                    try:
+                        return float(cleaned)
+                    except ValueError:
+                        return None
+        return None
+    # Formato lista (legacy)
+    if isinstance(features, list):
+        for feature in features:
+            if not isinstance(feature, dict):
+                continue
+            uri = feature.get("uri", "")
+            if "/price" in uri:
+                values = feature.get("values", [])
+                if values and isinstance(values[0], dict):
+                    raw = values[0].get("value", "")
+                    cleaned = re.sub(r"[^\d.,]", "", str(raw))
+                    if not cleaned:
+                        return None
+                    cleaned = cleaned.replace(".", "").replace(",", ".")
+                    try:
+                        return float(cleaned)
+                    except ValueError:
+                        return None
     return None
 
 

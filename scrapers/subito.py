@@ -474,22 +474,46 @@ class SubitoScraper(BaseScraper):
         return listings
 
     @staticmethod
-    def _extract_price_from_features(features: list) -> Optional[float]:
-        """Estrae il prezzo dalla lista features dell'API JSON."""
-        for feature in features:
-            uri = feature.get("uri", "")
-            if "/price" in uri:
-                values = feature.get("values", [])
-                if values:
-                    raw = values[0].get("value", "")
-                    cleaned = re.sub(r"[^\d.,]", "", str(raw))
-                    if not cleaned:
-                        return None
-                    cleaned = cleaned.replace(".", "").replace(",", ".")
-                    try:
-                        return float(cleaned)
-                    except ValueError:
-                        return None
+    def _extract_price_from_features(features) -> Optional[float]:
+        """Estrae il prezzo dalle features dell'API JSON.
+
+        Supporta sia il formato dict (chiavi = URI) che il vecchio formato lista.
+        """
+        # Formato attuale: dict con chiavi URI, es. {"/price": {"values": [...]}}
+        if isinstance(features, dict):
+            for uri, feature in features.items():
+                if "/price" in uri and isinstance(feature, dict):
+                    values = feature.get("values", [])
+                    if values and isinstance(values[0], dict):
+                        raw = values[0].get("value", "")
+                        cleaned = re.sub(r"[^\d.,]", "", str(raw))
+                        if not cleaned:
+                            return None
+                        cleaned = cleaned.replace(".", "").replace(",", ".")
+                        try:
+                            return float(cleaned)
+                        except ValueError:
+                            return None
+            return None
+
+        # Formato legacy: lista di dict con campo "uri"
+        if isinstance(features, list):
+            for feature in features:
+                if not isinstance(feature, dict):
+                    continue
+                uri = feature.get("uri", "")
+                if "/price" in uri:
+                    values = feature.get("values", [])
+                    if values and isinstance(values[0], dict):
+                        raw = values[0].get("value", "")
+                        cleaned = re.sub(r"[^\d.,]", "", str(raw))
+                        if not cleaned:
+                            return None
+                        cleaned = cleaned.replace(".", "").replace(",", ".")
+                        try:
+                            return float(cleaned)
+                        except ValueError:
+                            return None
         return None
 
     @staticmethod
