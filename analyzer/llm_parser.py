@@ -28,14 +28,16 @@ Rispondi con questo JSON:
   "model": "modello specifico",
   "variant": "variante (es. colore, storage, taglia)",
   "condition": "nuovo/come_nuovo/usato_buono/usato_discreto/ricambi",
-  "ebay_search_query": "query ottimizzata per cercare questo prodotto su eBay",
+  "ebay_search_query": "marca modello variante (2-5 parole)",
   "key_details": "dettagli rilevanti per il valore (es. batteria, accessori, difetti)",
   "confidence": "alta/media/bassa",
   "skip_reason": null
 }}
 
 Regole:
-- "ebay_search_query" deve essere una query di ricerca efficace per trovare lo stesso prodotto su eBay
+- "ebay_search_query" deve contenere SOLO marca + modello + variante essenziale (es. storage, colore)
+- "ebay_search_query" NON deve MAI contenere parole come: usato, nuovo, come nuovo, ottime condizioni, ricondizionato, spedizione, promo, offerta
+- "ebay_search_query" deve essere corta: 2-5 parole massimo. Esempi corretti: "Samsung Galaxy S22 256GB", "iPhone 14 Pro 128GB", "PS5 Digital"
 - Se l'inserzione e' per ricambi, lotti, o non e' un prodotto rivendibile, imposta skip_reason con il motivo
 - "confidence" e' bassa se il titolo/descrizione sono troppo vaghi per identificare il prodotto
 - Sii specifico con modello e variante quando possibile"""

@@ -66,6 +66,9 @@ class PriceChecker:
     ) -> Optional[PriceResult]:
         """Cerca prezzi di vendita su eBay per un dato prodotto.
 
+        Prova prima la query originale, poi con query semplificata,
+        poi senza filtro condizione.
+
         Args:
             search_query: Query di ricerca ottimizzata (dal LLM parser).
             condition: Condizione del prodotto per filtrare i risultati.
@@ -73,7 +76,25 @@ class PriceChecker:
         Returns:
             PriceResult con statistiche di prezzo, o None se la ricerca fallisce.
         """
-        prices = await self._scrape_sold_listings(search_query, condition)
+        # Pulisci la query da parole che non aiutano la ricerca eBay
+        clean_query = self._clean_query(search_query)
+
+        # Strategia di fallback: query pulita con condizione -> senza condizione -> query ridotta
+        attempts = [(clean_query, condition)]
+        if condition:
+            attempts.append((clean_query, ""))
+        short_query = self._shorten_query(clean_query)
+        if short_query != clean_query:
+            attempts.append((short_query, ""))
+
+        prices: list[float] = []
+        used_query = clean_query
+        for query, cond in attempts:
+            prices = await self._scrape_sold_listings(query, cond)
+            if prices:
+                used_query = query
+                break
+            logger.debug("Nessun risultato per '%s' (condizione='%s'), provo fallback", query, cond)
 
         if not prices:
             logger.info("Nessun venduto trovato su eBay per: %s", search_query)
@@ -101,13 +122,39 @@ class PriceChecker:
 
         logger.info(
             "eBay prezzo per '%s': mediana=%.2f, media=%.2f, venduti=%d, affidabile=%s",
-            search_query,
+            used_query,
             result.median_price,
             result.mean_price,
             result.sold_count,
             result.reliable,
         )
         return result
+
+    @staticmethod
+    def _clean_query(query: str) -> str:
+        """Rimuove parole inutili dalla query di ricerca eBay."""
+        noise_words = {
+            "usato", "usata", "usati", "usate",
+            "nuovo", "nuova", "nuovi", "nuove",
+            "come nuovo", "come nuova",
+            "ricondizionato", "ricondizionata", "refurbished",
+            "ottime condizioni", "buone condizioni", "perfetto stato",
+            "spedizione", "spedizione gratuita", "gratis",
+            "promo", "offerta", "affare", "occasione",
+            "originale", "garanzia",
+        }
+        result = query
+        for word in sorted(noise_words, key=len, reverse=True):
+            result = re.sub(rf'\b{re.escape(word)}\b', '', result, flags=re.IGNORECASE)
+        return re.sub(r'\s+', ' ', result).strip()
+
+    @staticmethod
+    def _shorten_query(query: str) -> str:
+        """Riduce la query alle prime 3 parole (marca + modello)."""
+        words = query.split()
+        if len(words) <= 3:
+            return query
+        return " ".join(words[:3])
 
     async def _scrape_sold_listings(
         self,
