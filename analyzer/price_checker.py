@@ -13,7 +13,10 @@ from utils.logger import get_logger
 
 logger = get_logger("price_checker")
 
-_EBAY_SEARCH_URL = "https://www.ebay.it/sch/i.html"
+_EBAY_SEARCH_URLS = [
+    "https://www.ebay.it/sch/i.html",
+    "https://www.ebay.com/sch/i.html",
+]
 
 _HEADERS = {
     "Accept": (
@@ -161,12 +164,11 @@ class PriceChecker:
         query: str,
         condition: str,
     ) -> list[float]:
-        """Scraping delle inserzioni vendute su eBay.it."""
+        """Scraping delle inserzioni vendute su eBay (prima .it, poi .com come fallback)."""
         params = {
             "_nkw": query,
             "LH_Complete": "1",     # Inserzioni completate
             "LH_Sold": "1",        # Solo vendute
-            "LH_BIN": "1",         # Solo Compralo Subito
             "_ipg": str(min(self._sold_items_count * 3, 240)),  # Risultati per pagina
             "_sop": "13",           # Ordina per piu' recenti
         }
@@ -181,19 +183,24 @@ class PriceChecker:
         if condition_id:
             params["LH_ItemCondition"] = condition_id
 
-        url = f"{_EBAY_SEARCH_URL}?{'&'.join(f'{k}={quote_plus(str(v))}' for k, v in params.items())}"
+        qs = "&".join(f"{k}={quote_plus(str(v))}" for k, v in params.items())
 
         async with AsyncSession(
             headers=_HEADERS,
             impersonate=_IMPERSONATE,
             timeout=_REQUEST_TIMEOUT,
         ) as session:
-            html = await self._fetch_with_retry(session, url)
+            for base_url in _EBAY_SEARCH_URLS:
+                url = f"{base_url}?{qs}"
+                html = await self._fetch_with_retry(session, url)
+                if not html:
+                    continue
+                prices = self._extract_prices_from_html(html)
+                if prices:
+                    return prices
+                logger.debug("Nessun prezzo estratto da %s, provo prossimo dominio", base_url)
 
-        if not html:
-            return []
-
-        return self._extract_prices_from_html(html)
+        return []
 
     async def _fetch_with_retry(self, session: AsyncSession, url: str) -> Optional[str]:
         """Fetch con retry ed exponential backoff."""
@@ -211,7 +218,22 @@ class PriceChecker:
                     logger.warning("eBay sold listings HTTP %d", resp.status_code)
                     return None
 
-                return resp.text
+                html = resp.text
+                logger.debug(
+                    "eBay risposta: %d caratteri, status=%d",
+                    len(html), resp.status_code,
+                )
+
+                # Controlla se eBay ha servito un CAPTCHA o pagina di blocco
+                html_lower = html.lower()
+                if "captcha" in html_lower or "robot" in html_lower:
+                    logger.warning("eBay: CAPTCHA rilevato, richiesta bloccata")
+                    return None
+                if "signin" in html_lower and "s-item" not in html_lower:
+                    logger.warning("eBay: redirect a pagina di login")
+                    return None
+
+                return html
 
             except Exception as e:
                 if attempt < _MAX_RETRIES - 1:
@@ -231,6 +253,22 @@ class PriceChecker:
 
         # Ogni risultato e' un <li> con classe s-item
         items = soup.select("li.s-item")
+        logger.debug("eBay HTML: %d li.s-item trovati", len(items))
+
+        if not items:
+            # Prova selettori alternativi nel caso eBay abbia cambiato struttura
+            for alt_sel in [
+                "ul.srp-results > li",
+                "[data-viewport]",
+                ".s-item__wrapper",
+            ]:
+                alt_items = soup.select(alt_sel)
+                if alt_items:
+                    logger.debug("eBay: selettore alternativo '%s' ha trovato %d elementi", alt_sel, len(alt_items))
+
+            # Log per debug: mostra titolo pagina e snippet
+            title = soup.title.string if soup.title else "N/A"
+            logger.info("eBay: nessun risultato nel parsing HTML (titolo pagina: %s)", title)
 
         for item in items:
             # Salta il primo item fittizio (placeholder eBay)
