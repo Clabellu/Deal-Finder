@@ -1,6 +1,8 @@
+import asyncio
 import os
 import re
 import statistics
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -17,6 +19,8 @@ _FINDING_URL = "https://svcs.ebay.com/services/search/FindingService/v1"
 _REQUEST_TIMEOUT = 15
 _MAX_RETRIES = 3
 _ITEMS_PER_PAGE = 100
+_CACHE_TTL = 3600  # 1 ora
+_API_DELAY = 1.1   # secondi tra chiamate API (rate limit eBay ~5000/giorno ≈ ~3.5/s)
 
 
 @dataclass
@@ -46,6 +50,10 @@ class PriceChecker:
         self._app_id = os.environ.get("EBAY_APP_ID", "")
         if not self._app_id:
             logger.warning("EBAY_APP_ID non impostato: il price checker non funzionera'")
+
+        # Cache in-memory: chiave = (query_normalizzata, condizione) -> (timestamp, list[float])
+        self._cache: dict[tuple[str, str], tuple[float, list[float]]] = {}
+        self._last_api_call: float = 0
 
     async def check_price(
         self,
@@ -81,7 +89,7 @@ class PriceChecker:
         prices: list[float] = []
         used_query = clean_query
         for query, cond in attempts:
-            prices = await self._fetch_completed_items(query, cond)
+            prices = await self._get_prices_cached(query, cond)
             if prices:
                 used_query = query
                 break
@@ -146,6 +154,30 @@ class PriceChecker:
         if len(words) <= 3:
             return query
         return " ".join(words[:3])
+
+    async def _get_prices_cached(self, query: str, condition: str) -> list[float]:
+        """Restituisce prezzi dalla cache se validi, altrimenti chiama l'API."""
+        cache_key = (query.lower().strip(), condition)
+        now = time.monotonic()
+
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            ts, prices = cached
+            if now - ts < _CACHE_TTL:
+                logger.debug("Cache hit per '%s' (%d prezzi)", query, len(prices))
+                return prices
+
+        # Rate limiting: attendi se l'ultima chiamata e' troppo recente
+        elapsed = now - self._last_api_call
+        if elapsed < _API_DELAY:
+            await asyncio.sleep(_API_DELAY - elapsed)
+
+        prices = await self._fetch_completed_items(query, condition)
+        self._last_api_call = time.monotonic()
+
+        # Salva in cache (anche risultati vuoti per evitare chiamate ripetute)
+        self._cache[cache_key] = (time.monotonic(), prices)
+        return prices
 
     async def _fetch_completed_items(
         self,
