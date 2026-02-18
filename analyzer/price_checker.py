@@ -19,8 +19,15 @@ _FINDING_URL = "https://svcs.ebay.com/services/search/FindingService/v1"
 _REQUEST_TIMEOUT = 15
 _MAX_RETRIES = 3
 _ITEMS_PER_PAGE = 100
-_CACHE_TTL = 3600  # 1 ora
-_API_DELAY = 1.1   # secondi tra chiamate API (rate limit eBay ~5000/giorno ≈ ~3.5/s)
+_CACHE_TTL = 3600       # 1 ora
+_API_DELAY = 2.0        # secondi tra chiamate API
+_BACKOFF_BASE = 5       # secondi di backoff iniziale su rate limit
+_BACKOFF_MAX = 120      # secondi massimi di backoff
+_RATE_LIMIT_RETRIES = 3 # tentativi su rate limit prima di arrendersi
+
+
+class _RateLimitError(Exception):
+    """Raised when eBay returns a rate limit error (HTTP 500, errorId 10001)."""
 
 
 @dataclass
@@ -89,8 +96,12 @@ class PriceChecker:
         prices: list[float] = []
         used_query = clean_query
         for query, cond in attempts:
-            prices = await self._get_prices_cached(query, cond)
-            if prices:
+            result = await self._get_prices_cached(query, cond)
+            if result is None:
+                # Rate limit o errore transitorio: inutile provare altre query
+                break
+            if result:
+                prices = result
                 used_query = query
                 break
             logger.debug("Nessun risultato per '%s' (condizione='%s'), provo fallback", query, cond)
@@ -155,8 +166,13 @@ class PriceChecker:
             return query
         return " ".join(words[:3])
 
-    async def _get_prices_cached(self, query: str, condition: str) -> list[float]:
-        """Restituisce prezzi dalla cache se validi, altrimenti chiama l'API."""
+    async def _get_prices_cached(self, query: str, condition: str) -> Optional[list[float]]:
+        """Restituisce prezzi dalla cache se validi, altrimenti chiama l'API.
+
+        Returns:
+            list[float] con prezzi (puo' essere vuota se nessun venduto),
+            oppure None se la chiamata e' fallita per rate limit.
+        """
         cache_key = (query.lower().strip(), condition)
         now = time.monotonic()
 
@@ -167,17 +183,32 @@ class PriceChecker:
                 logger.debug("Cache hit per '%s' (%d prezzi)", query, len(prices))
                 return prices
 
-        # Rate limiting: attendi se l'ultima chiamata e' troppo recente
-        elapsed = now - self._last_api_call
-        if elapsed < _API_DELAY:
-            await asyncio.sleep(_API_DELAY - elapsed)
+        # Retry con backoff esponenziale su rate limit
+        for attempt in range(_RATE_LIMIT_RETRIES):
+            # Rate limiting: attendi prima di chiamare
+            elapsed = time.monotonic() - self._last_api_call
+            if elapsed < _API_DELAY:
+                await asyncio.sleep(_API_DELAY - elapsed)
 
-        prices = await self._fetch_completed_items(query, condition)
-        self._last_api_call = time.monotonic()
+            try:
+                prices = await self._fetch_completed_items(query, condition)
+            except _RateLimitError:
+                backoff = min(_BACKOFF_BASE * (2 ** attempt), _BACKOFF_MAX)
+                logger.warning(
+                    "Rate limit eBay, backoff %ds (tentativo %d/%d)",
+                    backoff, attempt + 1, _RATE_LIMIT_RETRIES,
+                )
+                self._last_api_call = time.monotonic()
+                await asyncio.sleep(backoff)
+                continue
 
-        # Salva in cache (anche risultati vuoti per evitare chiamate ripetute)
-        self._cache[cache_key] = (time.monotonic(), prices)
-        return prices
+            self._last_api_call = time.monotonic()
+            self._cache[cache_key] = (time.monotonic(), prices)
+            return prices
+
+        # Tutti i tentativi esauriti per rate limit
+        logger.error("Rate limit eBay persistente per '%s', salto query", query)
+        return None
 
     async def _fetch_completed_items(
         self,
@@ -229,8 +260,12 @@ class PriceChecker:
                     if resp.status != 200:
                         body = await resp.text()
                         logger.warning("eBay Finding API HTTP %d: %s", resp.status, body[:300])
+                        if resp.status == 500 and "RateLimiter" in body:
+                            raise _RateLimitError(body[:300])
                         return []
                     data = await resp.json(content_type=None)
+        except _RateLimitError:
+            raise
         except Exception:
             logger.exception("Errore chiamata eBay Finding API (findCompletedItems)")
             return []
