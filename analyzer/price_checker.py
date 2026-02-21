@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from typing import Optional
 
 import aiohttp
+from bs4 import BeautifulSoup
+from curl_cffi.requests import AsyncSession
 from dotenv import load_dotenv
 
 from utils.logger import get_logger
@@ -19,11 +21,13 @@ _FINDING_URL = "https://svcs.ebay.com/services/search/FindingService/v1"
 _REQUEST_TIMEOUT = 15
 _MAX_RETRIES = 3
 _ITEMS_PER_PAGE = 100
-_CACHE_TTL = 3600       # 1 ora
+_DEFAULT_CACHE_TTL = 86400  # 24 ore (configurabile via config.yaml)
 _API_DELAY = 2.0        # secondi tra chiamate API
 _BACKOFF_BASE = 5       # secondi di backoff iniziale su rate limit
 _BACKOFF_MAX = 120      # secondi massimi di backoff
 _RATE_LIMIT_RETRIES = 3 # tentativi su rate limit prima di arrendersi
+
+_EBAY_SOLD_URL = "https://www.ebay.it/sch/i.html"
 
 
 class _RateLimitError(Exception):
@@ -51,10 +55,12 @@ class PriceChecker:
         use_median: bool = True,
         max_days_sold: int = 30,
         db=None,
+        cache_ttl: int = _DEFAULT_CACHE_TTL,
     ):
         self._sold_items_count = sold_items_count
         self._use_median = use_median
         self._max_days_sold = max_days_sold
+        self._cache_ttl = cache_ttl
         self._app_id = os.environ.get("EBAY_APP_ID", "")
         if not self._app_id:
             logger.warning("EBAY_APP_ID non impostato: il price checker non funzionera'")
@@ -63,6 +69,9 @@ class PriceChecker:
         # Cache in-memory: chiave = (query_normalizzata, condizione) -> (timestamp, list[float])
         self._cache: dict[tuple[str, str], tuple[float, list[float]]] = {}
         self._last_api_call: float = 0
+        # Flag globale: se True, skippa l'API e va diretto allo scraping
+        self._api_rate_limited = False
+        self._rate_limit_until: float = 0
 
     async def check_price(
         self,
@@ -71,8 +80,8 @@ class PriceChecker:
     ) -> Optional[PriceResult]:
         """Cerca prezzi di vendita su eBay per un dato prodotto.
 
-        Usa l'operazione findCompletedItems della Finding API per ottenere
-        i prezzi degli articoli venduti, senza scraping HTML.
+        Usa l'operazione findCompletedItems della Finding API. Se l'API e'
+        rate-limited, usa scraping eBay.it come fallback.
 
         Args:
             search_query: Query di ricerca ottimizzata (dal LLM parser).
@@ -81,9 +90,6 @@ class PriceChecker:
         Returns:
             PriceResult con statistiche di prezzo, o None se la ricerca fallisce.
         """
-        if not self._app_id:
-            logger.warning("EBAY_APP_ID mancante, impossibile controllare prezzi")
-            return None
 
         clean_query = self._clean_query(search_query)
 
@@ -171,11 +177,11 @@ class PriceChecker:
     async def _get_prices_cached(self, query: str, condition: str) -> Optional[list[float]]:
         """Restituisce prezzi dalla cache se validi, altrimenti chiama l'API.
 
-        Ordine: cache in-memory -> cache DB -> chiamata API eBay.
+        Ordine: cache in-memory -> cache DB -> API eBay -> scraping fallback.
 
         Returns:
             list[float] con prezzi (puo' essere vuota se nessun venduto),
-            oppure None se la chiamata e' fallita per rate limit.
+            oppure None se tutti i metodi falliscono.
         """
         cache_key = (query.lower().strip(), condition)
         now = time.monotonic()
@@ -184,14 +190,14 @@ class PriceChecker:
         cached = self._cache.get(cache_key)
         if cached is not None:
             ts, prices = cached
-            if now - ts < _CACHE_TTL:
+            if now - ts < self._cache_ttl:
                 logger.debug("Cache in-memory hit per '%s' (%d prezzi)", query, len(prices))
                 return prices
 
         # 2. Cache DB persistente
         if self._db is not None:
             try:
-                db_prices = await self._db.get_cached_prices(query, condition, _CACHE_TTL)
+                db_prices = await self._db.get_cached_prices(query, condition, self._cache_ttl)
                 if db_prices is not None:
                     logger.debug("Cache DB hit per '%s' (%d prezzi)", query, len(db_prices))
                     self._cache[cache_key] = (time.monotonic(), db_prices)
@@ -199,39 +205,74 @@ class PriceChecker:
             except Exception:
                 logger.debug("Errore lettura cache DB per '%s'", query, exc_info=True)
 
-        # 3. Chiamata API eBay con retry su rate limit
-        for attempt in range(_RATE_LIMIT_RETRIES):
-            elapsed = time.monotonic() - self._last_api_call
-            if elapsed < _API_DELAY:
-                await asyncio.sleep(_API_DELAY - elapsed)
+        # 3. Se l'API e' in rate limit globale, salta direttamente allo scraping
+        if self._api_rate_limited and time.monotonic() < self._rate_limit_until:
+            logger.debug("API eBay in rate limit globale, uso scraping per '%s'", query)
+            return await self._scrape_and_cache(query, condition, cache_key)
 
-            try:
-                prices = await self._fetch_completed_items(query, condition)
-            except _RateLimitError:
-                backoff = min(_BACKOFF_BASE * (2 ** attempt), _BACKOFF_MAX)
-                logger.warning(
-                    "Rate limit eBay, backoff %ds (tentativo %d/%d)",
-                    backoff, attempt + 1, _RATE_LIMIT_RETRIES,
-                )
+        # Reset del flag se il tempo e' scaduto
+        if self._api_rate_limited and time.monotonic() >= self._rate_limit_until:
+            self._api_rate_limited = False
+            logger.info("Rate limit eBay globale scaduto, riprovo API")
+
+        # 4. Chiamata API eBay (solo se abbiamo l'APP_ID)
+        if self._app_id:
+            for attempt in range(_RATE_LIMIT_RETRIES):
+                elapsed = time.monotonic() - self._last_api_call
+                if elapsed < _API_DELAY:
+                    await asyncio.sleep(_API_DELAY - elapsed)
+
+                try:
+                    prices = await self._fetch_completed_items(query, condition)
+                except _RateLimitError:
+                    backoff = min(_BACKOFF_BASE * (2 ** attempt), _BACKOFF_MAX)
+                    logger.warning(
+                        "Rate limit eBay API, backoff %ds (tentativo %d/%d)",
+                        backoff, attempt + 1, _RATE_LIMIT_RETRIES,
+                    )
+                    self._last_api_call = time.monotonic()
+                    await asyncio.sleep(backoff)
+                    continue
+
                 self._last_api_call = time.monotonic()
-                await asyncio.sleep(backoff)
-                continue
+                self._cache[cache_key] = (time.monotonic(), prices)
 
-            self._last_api_call = time.monotonic()
+                # Salva nel DB per persistenza tra riavvii
+                if self._db is not None:
+                    try:
+                        await self._db.save_cached_prices(query, condition, prices)
+                    except Exception:
+                        logger.debug("Errore scrittura cache DB per '%s'", query, exc_info=True)
+
+                return prices
+
+            # API rate-limited: attiva flag globale (evita di bruciare tentativi)
+            # e passa allo scraping per questa query e le prossime 10 minuti
+            self._api_rate_limited = True
+            self._rate_limit_until = time.monotonic() + 600  # 10 minuti
+            logger.warning(
+                "Rate limit eBay API persistente, passo a scraping per i prossimi 10 min"
+            )
+
+        # 5. Fallback: scraping eBay.it
+        return await self._scrape_and_cache(query, condition, cache_key)
+
+    async def _scrape_and_cache(
+        self, query: str, condition: str, cache_key: tuple[str, str]
+    ) -> Optional[list[float]]:
+        """Scraping fallback + salvataggio in cache."""
+        prices = await self._scrape_ebay_sold(query, condition)
+        if prices:
             self._cache[cache_key] = (time.monotonic(), prices)
-
-            # Salva nel DB per persistenza tra riavvii
             if self._db is not None:
                 try:
                     await self._db.save_cached_prices(query, condition, prices)
                 except Exception:
-                    logger.debug("Errore scrittura cache DB per '%s'", query, exc_info=True)
-
+                    logger.debug("Errore scrittura cache DB (scrape) per '%s'", query, exc_info=True)
             return prices
 
-        # Tutti i tentativi esauriti per rate limit
-        logger.error("Rate limit eBay persistente per '%s', salto query", query)
-        return None
+        logger.warning("Nessun prezzo trovato (API + scraping) per '%s'", query)
+        return []
 
     async def _fetch_completed_items(
         self,
@@ -336,3 +377,102 @@ class PriceChecker:
                 continue
 
         return prices
+
+    # ------------------------------------------------------------------ #
+    #  Scraping fallback: eBay.it pagina venduti                          #
+    # ------------------------------------------------------------------ #
+
+    async def _scrape_ebay_sold(self, query: str, condition: str) -> list[float]:
+        """Fallback: scrape eBay.it sold listings quando l'API e' rate-limited."""
+        params: dict[str, str] = {
+            "_nkw": query,
+            "LH_Complete": "1",
+            "LH_Sold": "1",
+            "_sop": "13",   # Sort: end date newest first
+            "rt": "nc",
+            "_ipg": "60",   # risultati per pagina
+        }
+
+        # Filtro condizione
+        condition_map = {
+            "nuovo": "1000",
+            "come_nuovo": "1500",
+            "usato_buono": "3000",
+            "usato_discreto": "3000",
+        }
+        cond_id = condition_map.get(condition)
+        if cond_id:
+            params["LH_ItemCondition"] = cond_id
+
+        try:
+            async with AsyncSession(impersonate="chrome") as session:
+                resp = await session.get(
+                    _EBAY_SOLD_URL,
+                    params=params,
+                    timeout=_REQUEST_TIMEOUT,
+                )
+                if resp.status_code != 200:
+                    logger.warning("eBay scrape HTTP %d per '%s'", resp.status_code, query)
+                    return []
+                html = resp.text
+        except Exception:
+            logger.warning("Errore scraping eBay.it per '%s'", query, exc_info=True)
+            return []
+
+        prices = self._parse_ebay_sold_html(html)
+        if prices:
+            logger.info(
+                "eBay scrape per '%s': %d prezzi estratti (mediana %.2f)",
+                query, len(prices), statistics.median(prices),
+            )
+        else:
+            logger.info("eBay scrape per '%s': nessun prezzo trovato", query)
+
+        return prices
+
+    @staticmethod
+    def _parse_ebay_sold_html(html: str) -> list[float]:
+        """Estrae i prezzi venduti dalla pagina HTML di eBay.it."""
+        soup = BeautifulSoup(html, "html.parser")
+        prices: list[float] = []
+
+        for item in soup.select("li.s-item"):
+            price_el = item.select_one(".s-item__price")
+            if not price_el:
+                continue
+            price_text = price_el.get_text(strip=True)
+            price = _parse_ebay_it_price(price_text)
+            if price and price > 0:
+                prices.append(price)
+
+        return prices
+
+
+def _parse_ebay_it_price(text: str) -> Optional[float]:
+    """Converte un prezzo eBay.it ('EUR 1.234,56' o '650,00 EUR') in float.
+
+    Gestisce il formato italiano: punto come separatore migliaia,
+    virgola come separatore decimale.
+    """
+    # Gestisce range di prezzo ("EUR 100,00 a EUR 200,00") -> prende il primo
+    if " a " in text.lower():
+        text = text.lower().split(" a ")[0]
+
+    # Rimuove tutto tranne cifre, punti e virgole
+    cleaned = re.sub(r"[^\d.,]", "", text)
+    if not cleaned:
+        return None
+
+    # Formato italiano: 1.234,56 -> 1234.56
+    # Se c'e' sia punto che virgola e la virgola e' dopo il punto -> formato IT
+    if "," in cleaned and "." in cleaned:
+        cleaned = cleaned.replace(".", "").replace(",", ".")
+    elif "," in cleaned:
+        # Solo virgola -> separatore decimale
+        cleaned = cleaned.replace(",", ".")
+    # Solo punto -> gia' formato standard (o migliaia senza decimali)
+
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None

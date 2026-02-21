@@ -44,6 +44,7 @@ pricing:
   ebay_sold_items_count: 20
   use_median: true
   max_days_sold: 30
+  cache_hours: 24          # ore di validita' della cache prezzi (24h per testing, 1-2h in produzione)
 
 # Notifiche
 notifications:
