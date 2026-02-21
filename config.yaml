@@ -5,7 +5,7 @@ polling_interval: 300  # 5 minuti
 min_margin_percent: 25
 
 # Numero massimo di inserzioni da processare per ciclo per piattaforma
-max_listings_per_cycle: 50
+max_listings_per_cycle: 20
 
 # Piattaforme attive
 platforms:
