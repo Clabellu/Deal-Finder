@@ -1,3 +1,5 @@
+import os
+
 import aiosqlite
 from datetime import datetime, timedelta
 
@@ -5,7 +7,7 @@ from utils.logger import get_logger
 
 logger = get_logger("database")
 
-DB_PATH = "deal_finder.db"
+DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "deal_finder.db")
 
 
 class Database:
