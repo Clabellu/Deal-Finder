@@ -187,6 +187,7 @@ class MonitorEngine:
             sold_items_count=pricing_config.get("ebay_sold_items_count", 20),
             use_median=pricing_config.get("use_median", True),
             max_days_sold=pricing_config.get("max_days_sold", 30),
+            db=db,
         )
 
         notifier = TelegramNotifier()

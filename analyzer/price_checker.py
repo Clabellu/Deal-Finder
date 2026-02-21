@@ -50,6 +50,7 @@ class PriceChecker:
         sold_items_count: int = 20,
         use_median: bool = True,
         max_days_sold: int = 30,
+        db=None,
     ):
         self._sold_items_count = sold_items_count
         self._use_median = use_median
@@ -58,6 +59,7 @@ class PriceChecker:
         if not self._app_id:
             logger.warning("EBAY_APP_ID non impostato: il price checker non funzionera'")
 
+        self._db = db  # Database instance per cache persistente
         # Cache in-memory: chiave = (query_normalizzata, condizione) -> (timestamp, list[float])
         self._cache: dict[tuple[str, str], tuple[float, list[float]]] = {}
         self._last_api_call: float = 0
@@ -169,6 +171,8 @@ class PriceChecker:
     async def _get_prices_cached(self, query: str, condition: str) -> Optional[list[float]]:
         """Restituisce prezzi dalla cache se validi, altrimenti chiama l'API.
 
+        Ordine: cache in-memory -> cache DB -> chiamata API eBay.
+
         Returns:
             list[float] con prezzi (puo' essere vuota se nessun venduto),
             oppure None se la chiamata e' fallita per rate limit.
@@ -176,16 +180,27 @@ class PriceChecker:
         cache_key = (query.lower().strip(), condition)
         now = time.monotonic()
 
+        # 1. Cache in-memory
         cached = self._cache.get(cache_key)
         if cached is not None:
             ts, prices = cached
             if now - ts < _CACHE_TTL:
-                logger.debug("Cache hit per '%s' (%d prezzi)", query, len(prices))
+                logger.debug("Cache in-memory hit per '%s' (%d prezzi)", query, len(prices))
                 return prices
 
-        # Retry con backoff esponenziale su rate limit
+        # 2. Cache DB persistente
+        if self._db is not None:
+            try:
+                db_prices = await self._db.get_cached_prices(query, condition, _CACHE_TTL)
+                if db_prices is not None:
+                    logger.debug("Cache DB hit per '%s' (%d prezzi)", query, len(db_prices))
+                    self._cache[cache_key] = (time.monotonic(), db_prices)
+                    return db_prices
+            except Exception:
+                logger.debug("Errore lettura cache DB per '%s'", query, exc_info=True)
+
+        # 3. Chiamata API eBay con retry su rate limit
         for attempt in range(_RATE_LIMIT_RETRIES):
-            # Rate limiting: attendi prima di chiamare
             elapsed = time.monotonic() - self._last_api_call
             if elapsed < _API_DELAY:
                 await asyncio.sleep(_API_DELAY - elapsed)
@@ -204,6 +219,14 @@ class PriceChecker:
 
             self._last_api_call = time.monotonic()
             self._cache[cache_key] = (time.monotonic(), prices)
+
+            # Salva nel DB per persistenza tra riavvii
+            if self._db is not None:
+                try:
+                    await self._db.save_cached_prices(query, condition, prices)
+                except Exception:
+                    logger.debug("Errore scrittura cache DB per '%s'", query, exc_info=True)
+
             return prices
 
         # Tutti i tentativi esauriti per rate limit

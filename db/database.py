@@ -1,3 +1,4 @@
+import json
 import os
 
 import aiosqlite
@@ -52,6 +53,14 @@ class Database:
                 market_price REAL,
                 margin_percent REAL,
                 notified_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS price_cache (
+                query TEXT NOT NULL,
+                condition TEXT NOT NULL DEFAULT '',
+                prices_json TEXT NOT NULL,
+                cached_at TEXT NOT NULL,
+                PRIMARY KEY (query, condition)
             );
             """
         )
@@ -150,6 +159,36 @@ class Database:
             for r in rows
         ]
 
+    async def get_cached_prices(
+        self, query: str, condition: str, max_age_seconds: int = 3600
+    ) -> list[float] | None:
+        """Restituisce i prezzi dalla cache DB se ancora validi, altrimenti None."""
+        assert self._db is not None
+        cursor = await self._db.execute(
+            "SELECT prices_json, cached_at FROM price_cache WHERE query = ? AND condition = ?",
+            (query.lower().strip(), condition),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        cached_at = datetime.fromisoformat(row[1])
+        age = (datetime.utcnow() - cached_at).total_seconds()
+        if age > max_age_seconds:
+            return None
+        return json.loads(row[0])
+
+    async def save_cached_prices(
+        self, query: str, condition: str, prices: list[float]
+    ) -> None:
+        """Salva i prezzi eBay nella cache DB."""
+        assert self._db is not None
+        await self._db.execute(
+            """INSERT OR REPLACE INTO price_cache (query, condition, prices_json, cached_at)
+               VALUES (?, ?, ?, ?)""",
+            (query.lower().strip(), condition, json.dumps(prices), datetime.utcnow().isoformat()),
+        )
+        await self._db.commit()
+
     async def cleanup_old_records(self, days: int = 30) -> int:
         """Rimuove record piu' vecchi di N giorni. Restituisce il numero di righe eliminate."""
         assert self._db is not None
@@ -165,8 +204,15 @@ class Database:
         )
         deleted_notif = cursor.rowcount
 
+        # Cache prezzi: rimuovi record piu' vecchi di 7 giorni
+        cache_cutoff = (datetime.utcnow() - timedelta(days=7)).isoformat()
+        cursor = await self._db.execute(
+            "DELETE FROM price_cache WHERE cached_at < ?", (cache_cutoff,)
+        )
+        deleted_cache = cursor.rowcount
+
         await self._db.commit()
-        total = deleted_seen + deleted_notif
+        total = deleted_seen + deleted_notif + deleted_cache
         if total > 0:
             logger.info(
                 "Pulizia DB: rimossi %d seen_listings, %d notifications",
