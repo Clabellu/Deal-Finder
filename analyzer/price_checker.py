@@ -27,10 +27,6 @@ _BACKOFF_BASE = 5       # secondi di backoff iniziale su rate limit
 _BACKOFF_MAX = 120      # secondi massimi di backoff
 _RATE_LIMIT_RETRIES = 3 # tentativi su rate limit prima di arrendersi
 
-# Sconto applicato ai prezzi delle inserzioni attive (non ancora vendute)
-# perche' i prezzi di listino tendono ad essere piu' alti dei prezzi reali di vendita
-_ACTIVE_LISTING_DISCOUNT = 0.85
-
 _EBAY_SOLD_URL = "https://www.ebay.it/sch/i.html"
 
 
@@ -135,13 +131,12 @@ class PriceChecker:
                 if result is None:
                     break
                 if result:
-                    # Applica sconto: i prezzi di listino sono piu' alti dei prezzi reali
-                    prices = [p * _ACTIVE_LISTING_DISCOUNT for p in result]
+                    prices = result
                     used_query = query
                     from_active = True
                     logger.info(
-                        "Trovati %d prezzi da inserzioni attive per '%s' (sconto %.0f%% applicato)",
-                        len(prices), query, (1 - _ACTIVE_LISTING_DISCOUNT) * 100,
+                        "Trovati %d prezzi da inserzioni attive per '%s'",
+                        len(prices), query,
                     )
                     break
 
