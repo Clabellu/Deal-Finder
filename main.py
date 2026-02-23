@@ -297,6 +297,7 @@ async def main() -> None:
                         break
                     await asyncio.sleep(1)
     finally:
+        await price_checker.close()
         await bot.stop()
         await db.close()
         logger.info("Deal Finder arrestato")
