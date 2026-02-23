@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import random
 import re
@@ -438,45 +439,36 @@ class PriceChecker:
     def _parse_ebay_html(html: str) -> list[float]:
         """Estrae i prezzi dalla pagina HTML di eBay.it (venduti o attivi).
 
-        Prova piu' selettori CSS per gestire variazioni del layout eBay.
+        Strategia multi-livello:
+        1. Selettori CSS (metodo classico)
+        2. JSON-LD structured data (Schema.org, piu' stabile)
+        3. JSON embedded nei tag <script> della pagina
         """
         soup = BeautifulSoup(html, "html.parser")
-        prices: list[float] = []
 
-        items = soup.select("li.s-item")
-        if not items:
-            items = soup.select("div.s-item__wrapper")
-        if not items:
-            items = soup.select("[data-viewport]")
+        # --- Metodo 1: selettori CSS ---
+        prices = _parse_css_selectors(soup)
+        if prices:
+            return prices
 
-        if not items:
-            snippet = html[:500] if len(html) > 500 else html
-            logger.debug(
-                "eBay scrape: nessun item nell'HTML (len=%d). Snippet: %s",
-                len(html), snippet,
-            )
-            return []
+        # --- Metodo 2: JSON-LD (application/ld+json) ---
+        prices = _parse_json_ld(soup)
+        if prices:
+            logger.debug("Prezzi estratti via JSON-LD: %d", len(prices))
+            return prices
 
-        price_selectors = [
-            ".s-item__price",
-            ".s-item__detail--price",
-            "[class*='s-item__price']",
-        ]
+        # --- Metodo 3: JSON embedded negli script ---
+        prices = _parse_embedded_json(html)
+        if prices:
+            logger.debug("Prezzi estratti via JSON embedded: %d", len(prices))
+            return prices
 
-        for item in items:
-            price_el = None
-            for sel in price_selectors:
-                price_el = item.select_one(sel)
-                if price_el:
-                    break
-            if not price_el:
-                continue
-            price_text = price_el.get_text(strip=True)
-            price = _parse_ebay_it_price(price_text)
-            if price and price > 0:
-                prices.append(price)
-
-        return prices
+        snippet = html[:500] if len(html) > 500 else html
+        logger.debug(
+            "eBay scrape: nessun prezzo trovato con nessun metodo (len=%d). Snippet: %s",
+            len(html), snippet,
+        )
+        return []
 
     # ------------------------------------------------------------------ #
     #  API eBay: ultima risorsa (opzionale)                                #
@@ -581,6 +573,233 @@ class PriceChecker:
                 continue
 
         return prices
+
+
+# ------------------------------------------------------------------ #
+#  Funzioni di parsing HTML: CSS, JSON-LD, JSON embedded               #
+# ------------------------------------------------------------------ #
+
+
+def _parse_css_selectors(soup: BeautifulSoup) -> list[float]:
+    """Estrae prezzi tramite selettori CSS classici."""
+    items = soup.select("li.s-item")
+    if not items:
+        items = soup.select("div.s-item__wrapper")
+    if not items:
+        items = soup.select("[data-viewport]")
+    if not items:
+        return []
+
+    price_selectors = [
+        ".s-item__price",
+        ".s-item__detail--price",
+        "[class*='s-item__price']",
+    ]
+
+    prices: list[float] = []
+    for item in items:
+        price_el = None
+        for sel in price_selectors:
+            price_el = item.select_one(sel)
+            if price_el:
+                break
+        if not price_el:
+            continue
+        price_text = price_el.get_text(strip=True)
+        price = _parse_ebay_it_price(price_text)
+        if price and price > 0:
+            prices.append(price)
+
+    return prices
+
+
+def _parse_json_ld(soup: BeautifulSoup) -> list[float]:
+    """Estrae prezzi dai tag <script type='application/ld+json'> (Schema.org).
+
+    eBay include spesso dati strutturati JSON-LD per SEO.
+    Strutture supportate:
+    - ItemList con itemListElement[].offers.price
+    - Product con offers.price / offers[].price
+    - SearchResultsPage con mainEntity.itemListElement[]
+    """
+    prices: list[float] = []
+
+    for script_tag in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script_tag.string or "")
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+        if not isinstance(data, dict):
+            # Puo' essere una lista di oggetti JSON-LD
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict):
+                        prices.extend(_extract_prices_from_ld(item))
+            continue
+
+        prices.extend(_extract_prices_from_ld(data))
+
+    return prices
+
+
+def _extract_prices_from_ld(data: dict) -> list[float]:
+    """Estrae prezzi da un singolo oggetto JSON-LD."""
+    prices: list[float] = []
+    ld_type = data.get("@type", "")
+
+    # ItemList: lista di prodotti nella pagina di ricerca
+    if ld_type == "ItemList":
+        for element in data.get("itemListElement", []):
+            if isinstance(element, dict):
+                price = _get_price_from_offer(element)
+                if price:
+                    prices.append(price)
+                # Nested: element.item.offers
+                item = element.get("item", {})
+                if isinstance(item, dict):
+                    price = _get_price_from_offer(item)
+                    if price:
+                        prices.append(price)
+
+    # Product: singolo prodotto con offerte
+    elif ld_type == "Product":
+        price = _get_price_from_offer(data)
+        if price:
+            prices.append(price)
+
+    # SearchResultsPage: pagina di risultati
+    elif ld_type == "SearchResultsPage":
+        main_entity = data.get("mainEntity", {})
+        if isinstance(main_entity, dict):
+            for element in main_entity.get("itemListElement", []):
+                if isinstance(element, dict):
+                    price = _get_price_from_offer(element)
+                    if price:
+                        prices.append(price)
+                    item = element.get("item", {})
+                    if isinstance(item, dict):
+                        price = _get_price_from_offer(item)
+                        if price:
+                            prices.append(price)
+
+    # CollectionPage o generico con mainEntity
+    elif "mainEntity" in data:
+        main = data["mainEntity"]
+        if isinstance(main, dict):
+            prices.extend(_extract_prices_from_ld(main))
+        elif isinstance(main, list):
+            for item in main:
+                if isinstance(item, dict):
+                    prices.extend(_extract_prices_from_ld(item))
+
+    return prices
+
+
+def _get_price_from_offer(data: dict) -> Optional[float]:
+    """Estrae un prezzo dal campo 'offers' di un oggetto JSON-LD."""
+    offers = data.get("offers", data.get("offer", {}))
+
+    if isinstance(offers, dict):
+        return _parse_ld_price(offers.get("price") or offers.get("lowPrice"))
+
+    if isinstance(offers, list):
+        # Prende il primo prezzo valido
+        for offer in offers:
+            if isinstance(offer, dict):
+                price = _parse_ld_price(offer.get("price") or offer.get("lowPrice"))
+                if price:
+                    return price
+                # Nested: offer.itemOffered[].offers[].price
+                item_offered = offer.get("itemOffered", [])
+                if isinstance(item_offered, list):
+                    for sub in item_offered:
+                        if isinstance(sub, dict):
+                            sub_price = _get_price_from_offer(sub)
+                            if sub_price:
+                                return sub_price
+
+    # Prezzo diretto sull'oggetto
+    return _parse_ld_price(data.get("price"))
+
+
+def _parse_ld_price(value) -> Optional[float]:
+    """Converte un valore prezzo JSON-LD in float."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) if value > 0 else None
+    if isinstance(value, str):
+        return _parse_ebay_it_price(value)
+    return None
+
+
+def _parse_embedded_json(html: str) -> list[float]:
+    """Cerca dati di prezzo in JSON embedded nei tag <script> della pagina.
+
+    eBay a volte include dati strutturati in variabili JS
+    (es. __NEXT_DATA__, window.__data, ecc.)
+    """
+    prices: list[float] = []
+
+    # Pattern: cerca oggetti JSON con campi prezzo
+    for match in re.finditer(
+        r'<script[^>]*>(.*?)</script>', html, re.DOTALL
+    ):
+        text = match.group(1).strip()
+        if len(text) < 50 or len(text) > 500_000:
+            continue
+        # Cerca solo script che contengono indicatori di prezzo
+        if '"price"' not in text and '"prc"' not in text:
+            continue
+
+        # Prova a estrarre JSON da assegnazioni tipo var X = {...}
+        json_match = re.search(r'=\s*(\{.+\})\s*;?\s*$', text, re.DOTALL)
+        if not json_match:
+            # Prova JSON diretto
+            if text.startswith("{"):
+                json_match = re.match(r'(\{.+\})', text, re.DOTALL)
+        if not json_match:
+            continue
+
+        try:
+            data = json.loads(json_match.group(1))
+        except (json.JSONDecodeError, RecursionError):
+            continue
+
+        # Cerca ricorsivamente campi "price" nel JSON
+        found = _dig_prices(data, depth=0)
+        if found:
+            prices.extend(found)
+            break  # Un blocco di dati e' sufficiente
+
+    return prices
+
+
+def _dig_prices(data, depth: int) -> list[float]:
+    """Cerca ricorsivamente campi prezzo in un dizionario JSON."""
+    if depth > 6:
+        return []
+    prices: list[float] = []
+
+    if isinstance(data, dict):
+        # Campi prezzo comuni
+        for key in ("price", "prc", "currentPrice", "salePrice", "binPrice"):
+            val = data.get(key)
+            if val is not None:
+                parsed = _parse_ld_price(val)
+                if parsed and parsed > 0:
+                    prices.append(parsed)
+        # Recurse
+        for v in data.values():
+            if isinstance(v, (dict, list)):
+                prices.extend(_dig_prices(v, depth + 1))
+    elif isinstance(data, list):
+        for item in data[:100]:  # Limita per performance
+            if isinstance(item, (dict, list)):
+                prices.extend(_dig_prices(item, depth + 1))
+
+    return prices
 
 
 def _parse_ebay_it_price(text: str) -> Optional[float]:
