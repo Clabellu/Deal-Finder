@@ -91,60 +91,20 @@ class PriceChecker:
         self._last_scrape: float = 0
         # Sessione scraping condivisa (inizializzata al primo uso)
         self._session: Optional[AsyncSession] = None
-        self._warmed_up = False
 
     async def _ensure_session(self) -> AsyncSession:
-        """Crea/riusa la sessione scraping con warm-up iniziale."""
+        """Crea/riusa la sessione scraping.
+
+        Non fa warm-up sulla homepage (causa curl error 23 su eBay.it).
+        La ricerca diretta funziona senza warm-up.
+        """
         if self._session is None:
             self._session = AsyncSession(
                 headers=_HEADERS,
                 impersonate=_IMPERSONATE,
                 timeout=_REQUEST_TIMEOUT,
             )
-
-        if not self._warmed_up:
-            try:
-                resp = await self._session.get("https://www.ebay.it/")
-                logger.debug("eBay warm-up: HTTP %d", resp.status_code)
-
-                # Accetta cookie consent GDPR se presente
-                if "consent" in resp.text.lower() or "gdpr" in resp.text.lower():
-                    await self._accept_ebay_consent()
-
-                await asyncio.sleep(random.uniform(1.0, 2.0))
-                self._warmed_up = True
-            except Exception:
-                logger.debug("eBay warm-up fallito, continuo comunque")
-                self._warmed_up = True
-
         return self._session
-
-    async def _accept_ebay_consent(self):
-        """Tenta di accettare il cookie consent GDPR di eBay."""
-        if self._session is None:
-            return
-        consent_endpoints = [
-            "https://www.ebay.it/gdpr/consent",
-            "https://consent.ebay.it/api/accept",
-        ]
-        for url in consent_endpoints:
-            try:
-                r = await self._session.post(
-                    url,
-                    headers={"Referer": "https://www.ebay.it/"},
-                )
-                if r.status_code < 400:
-                    logger.debug("eBay consent accettato via %s (HTTP %d)", url, r.status_code)
-                    return
-            except Exception:
-                continue
-        # Fallback: imposta cookie consent manualmente
-        try:
-            self._session.cookies.set("CONSENT_ACCEPTED", "true", domain=".ebay.it")
-            self._session.cookies.set("dp1", "bu1p/QEBfg**6e5e5e82^", domain=".ebay.it")
-            logger.debug("eBay consent: cookies impostati manualmente")
-        except Exception:
-            pass
 
     async def close(self):
         """Chiude la sessione scraping."""
@@ -627,28 +587,62 @@ class PriceChecker:
 
 
 def _parse_css_selectors(soup: BeautifulSoup) -> list[float]:
-    """Estrae prezzi tramite selettori CSS classici."""
-    # Prova vari selettori per trovare gli item
-    item_selectors = [
-        "li.s-item",
-        "div.s-item__wrapper",
-        "[data-viewport]",
-        "ul.srp-results li",
-        "div.srp-river-results li",
-        ".srp-results .s-item",
-    ]
-    items = []
-    for sel in item_selectors:
-        items = soup.select(sel)
-        if items:
-            break
-    if not items:
-        return []
+    """Estrae prezzi tramite selettori CSS.
 
+    Supporta sia la vecchia struttura (s-item) che la nuova (eBay Marko.js).
+    """
+    # --- Tentativo 1: vecchi selettori s-item ---
+    items = soup.select("li.s-item")
+    if items:
+        return _extract_prices_from_items(items)
+
+    # --- Tentativo 2: nuova struttura eBay ---
+    # eBay ora usa <ul> dentro srp-results con <li> senza classe s-item
+    srp = soup.select_one("[class*='srp-results']")
+    if not srp:
+        srp = soup.select_one("[id*='srp-results']")
+    if not srp:
+        # Cerca per attributo data
+        srp = soup.find(attrs={"data-view": re.compile(r"results", re.I)})
+
+    if srp:
+        # Prendi tutti i <li> diretti che contengono un link
+        items = [li for li in srp.find_all("li", recursive=False) if li.find("a")]
+        if not items:
+            # Prova anche <li> nested
+            items = [li for li in srp.find_all("li") if li.find("a", href=re.compile(r"/itm/"))]
+        if items:
+            return _extract_prices_from_items(items)
+
+    # --- Tentativo 3: cerca tutti i link /itm/ e risali al parent ---
+    itm_links = soup.find_all("a", href=re.compile(r"ebay\.it/itm/"))
+    if len(itm_links) >= 5:
+        prices: list[float] = []
+        for link in itm_links:
+            # Cerca prezzo nel parent del link
+            parent = link.parent
+            if parent is None:
+                continue
+            for span in parent.find_all("span"):
+                text = span.get_text(strip=True)
+                if re.search(r"EUR|€", text) and re.search(r"\d+,\d{2}", text):
+                    price = _parse_ebay_it_price(text)
+                    if price and price > 5:
+                        prices.append(price)
+                        break
+        if prices:
+            return prices
+
+    return []
+
+
+def _extract_prices_from_items(items: list) -> list[float]:
+    """Estrae prezzi da una lista di elementi item (vecchio o nuovo formato)."""
     price_selectors = [
         ".s-item__price",
         ".s-item__detail--price",
         "[class*='s-item__price']",
+        "[class*='price']",
         "span.BOLD",
     ]
 
@@ -660,17 +654,17 @@ def _parse_css_selectors(soup: BeautifulSoup) -> list[float]:
             if price_el:
                 break
         if not price_el:
-            # Fallback: cerca qualsiasi span con testo che sembra un prezzo EUR
+            # Fallback: cerca qualsiasi span con prezzo EUR/€ e decimali
             for span in item.find_all("span"):
                 text = span.get_text(strip=True)
-                if re.search(r"EUR|\u20ac", text) and re.search(r"\d", text):
+                if re.search(r"EUR|€", text) and re.search(r"\d+,\d{2}", text):
                     price_el = span
                     break
         if not price_el:
             continue
         price_text = price_el.get_text(strip=True)
         price = _parse_ebay_it_price(price_text)
-        if price and price > 0:
+        if price and price > 5:
             prices.append(price)
 
     return prices
@@ -800,41 +794,60 @@ def _parse_ld_price(value) -> Optional[float]:
 def _parse_embedded_json(html: str) -> list[float]:
     """Cerca dati di prezzo in JSON embedded nei tag <script> della pagina.
 
-    eBay a volte include dati strutturati in variabili JS
-    (es. __NEXT_DATA__, window.__data, ecc.)
+    eBay usa Marko.js e include dati in vari formati:
+    - var X = {...};
+    - window.__data = {...};
+    - JSON diretto in script tag
+    - Array di oggetti con prezzi
     """
     prices: list[float] = []
 
-    # Pattern: cerca oggetti JSON con campi prezzo
     for match in re.finditer(
         r'<script[^>]*>(.*?)</script>', html, re.DOTALL
     ):
         text = match.group(1).strip()
-        if len(text) < 50 or len(text) > 500_000:
+        if len(text) < 50:
             continue
         # Cerca solo script che contengono indicatori di prezzo
         if '"price"' not in text and '"prc"' not in text:
             continue
 
-        # Prova a estrarre JSON da assegnazioni tipo var X = {...}
-        json_match = re.search(r'=\s*(\{.+\})\s*;?\s*$', text, re.DOTALL)
-        if not json_match:
-            # Prova JSON diretto
-            if text.startswith("{"):
-                json_match = re.match(r'(\{.+\})', text, re.DOTALL)
-        if not json_match:
-            continue
+        # Strategia 1: assegnazione JS (var X = {...}; o window.X = {...};)
+        for json_match in re.finditer(r'=\s*(\{.+?\})\s*;', text, re.DOTALL):
+            try:
+                data = json.loads(json_match.group(1))
+                found = _dig_prices(data, depth=0)
+                if found:
+                    prices.extend(found)
+                    return prices
+            except (json.JSONDecodeError, RecursionError):
+                continue
 
-        try:
-            data = json.loads(json_match.group(1))
-        except (json.JSONDecodeError, RecursionError):
-            continue
+        # Strategia 2: JSON diretto nel tag
+        if text.lstrip().startswith("{"):
+            try:
+                data = json.loads(text.strip().rstrip(";"))
+                found = _dig_prices(data, depth=0)
+                if found:
+                    prices.extend(found)
+                    return prices
+            except (json.JSONDecodeError, RecursionError):
+                pass
 
-        # Cerca ricorsivamente campi "price" nel JSON
-        found = _dig_prices(data, depth=0)
-        if found:
-            prices.extend(found)
-            break  # Un blocco di dati e' sufficiente
+        # Strategia 3: cerca sottostringhe JSON con "price"
+        for sub_match in re.finditer(
+            r'\{[^{}]*"price"\s*:\s*["\d][^{}]*\}', text
+        ):
+            try:
+                obj = json.loads(sub_match.group(0))
+                price = _parse_ld_price(obj.get("price"))
+                if price and price > 0:
+                    prices.append(price)
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        if prices:
+            return prices
 
     return prices
 
@@ -868,26 +881,31 @@ def _dig_prices(data, depth: int) -> list[float]:
 def _parse_regex_fallback(html: str) -> list[float]:
     """Fallback: cerca prezzi direttamente nell'HTML con regex.
 
-    Usato quando i selettori CSS e JSON non trovano nulla.
-    Cerca pattern come 'EUR 350,00' o '350,00 EUR' o '€ 350,00'
-    all'interno di tag che sembrano contenere prezzi di listing.
+    Usato quando i selettori CSS e JSON non trovano nulla (es. eBay
+    ha cambiato le classi CSS e non usa JSON-LD).
+    Cerca pattern 'EUR 350,00' / '350,00 EUR' / '€ 350,00' con decimali,
+    filtrando rumore (prezzi da filtri sidebar, spedizione, ecc.).
     """
     prices: list[float] = []
     seen: set[float] = set()
 
-    # Cerca prezzi nel contesto di elementi s-item (anche con classi parziali)
-    # Pattern: prezzo in formato italiano vicino a indicatori di listing
+    # Richiedi almeno la virgola decimale per evitare numeri da filtri/contatori
+    # Es. "EUR 227,74" si', "EUR1000" no (probabile filtro sidebar)
     price_pattern = re.compile(
-        r'(?:EUR\s*|€\s*)(\d{1,3}(?:\.\d{3})*(?:,\d{2})?)|'
-        r'(\d{1,3}(?:\.\d{3})*(?:,\d{2})?)\s*(?:EUR|€)',
+        r'(?:EUR\s+|€\s*)(\d{1,3}(?:\.\d{3})*,\d{2})\b|'
+        r'\b(\d{1,3}(?:\.\d{3})*,\d{2})\s*(?:EUR|€)',
     )
 
-    # Cerca solo nelle sezioni che contengono risultati di ricerca
+    # Cerca solo nella sezione risultati di ricerca
     results_section = html
-    for marker in ("srp-results", "srp-river", "ListViewInner", "mainContent"):
+    for marker in ("srp-results", "srp-river", "ListViewInner"):
         idx = html.find(marker)
         if idx != -1:
-            results_section = html[idx:]
+            # Prendi fino alla fine della sezione (approssimativo)
+            end_idx = html.find("</ul>", idx + 50000)
+            if end_idx == -1:
+                end_idx = min(idx + 500000, len(html))
+            results_section = html[idx:end_idx]
             break
 
     for m in price_pattern.finditer(results_section):
@@ -895,7 +913,7 @@ def _parse_regex_fallback(html: str) -> list[float]:
         if not price_str:
             continue
         price = _parse_ebay_it_price(price_str)
-        if price and 1 < price < 50000 and price not in seen:
+        if price and 5 < price < 50000 and price not in seen:
             seen.add(price)
             prices.append(price)
 
