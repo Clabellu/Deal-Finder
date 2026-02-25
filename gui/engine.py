@@ -115,6 +115,8 @@ class MonitorEngine:
         sold_count: int = 0,
         status: str = "",
         url: str = "",
+        active_median: float = 0,
+        active_count: int = 0,
     ) -> None:
         if self.on_listing_analyzed:
             self.on_listing_analyzed({
@@ -127,6 +129,8 @@ class MonitorEngine:
                 "sold_count": sold_count,
                 "status": status,
                 "url": url,
+                "active_median": active_median,
+                "active_count": active_count,
             })
 
     def _run_loop(self) -> None:
@@ -343,6 +347,8 @@ class MonitorEngine:
                                 market_price=reference_price, margin_percent=margin_percent,
                                 sold_count=price_result.sold_count, status="sotto_soglia",
                                 url=listing.url,
+                                active_median=price_result.active_median,
+                                active_count=price_result.active_count,
                             )
                             continue
 
@@ -353,6 +359,8 @@ class MonitorEngine:
                             market_price=reference_price, margin_percent=margin_percent,
                             sold_count=price_result.sold_count, status="deal",
                             url=listing.url,
+                            active_median=price_result.active_median,
+                            active_count=price_result.active_count,
                         )
 
                         try:

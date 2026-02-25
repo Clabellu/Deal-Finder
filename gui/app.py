@@ -243,16 +243,16 @@ class DealFinderApp(ctk.CTk):
             dot.pack(side="left", padx=(0, 2))
             ctk.CTkLabel(legend, text=text, text_color="gray60", font=ctk.CTkFont(size=11)).pack(side="left", padx=(0, 12))
 
-        # Tabella analisi — 4 colonne come richiesto
+        # Tabella analisi — 5 colonne
         self.analysis_scroll = ctk.CTkScrollableFrame(frame)
         self.analysis_scroll.pack(fill="both", expand=True)
 
-        # Colonne: Annuncio (Subito/eBay) | Prezzo eBay venduti | Margine | Link
-        col_weights = [4, 2, 2, 1]
+        # Colonne: Prezzo Subito | Prezzo eBay | Media venduti | Margine | Link
+        col_weights = [3, 2, 2, 2, 1]
         for i, w in enumerate(col_weights):
             self.analysis_scroll.columnconfigure(i, weight=w)
 
-        headers = ["Annuncio", "Media eBay venduti", "Margine", "Link"]
+        headers = ["Prezzo Subito", "Prezzo eBay", "Media venduti", "Margine", "Link"]
         for i, h in enumerate(headers):
             ctk.CTkLabel(
                 self.analysis_scroll, text=h,
@@ -281,12 +281,14 @@ class DealFinderApp(ctk.CTk):
 
         status = data.get("status", "")
         asked = data.get("asked_price", 0)
-        market = data.get("market_price", 0)
+        market = data.get("market_price", 0)  # mediana venduti
         margin = data.get("margin_percent", 0)
         sold = data.get("sold_count", 0)
         platform = data.get("platform", "").capitalize()
-        product = data.get("product_name", "—")[:40]
+        product = data.get("product_name", "—")[:35]
         url = data.get("url", "")
+        active_median = data.get("active_median", 0)
+        active_count = data.get("active_count", 0)
 
         # Determina colore in base allo stato
         status_colors = {
@@ -301,60 +303,68 @@ class DealFinderApp(ctk.CTk):
         if market > 0 and margin < 0:
             color = "#d73a49"
 
-        # Colonna 1: Annuncio (piattaforma + prodotto + prezzo chiesto)
-        annuncio_text = f"[{platform}] {product} — {asked:.0f} EUR"
-
-        # Colonna 2: Media eBay venduti
-        if market > 0:
-            ebay_text = f"{market:.0f} EUR ({sold} venduti)"
-        else:
-            status_labels = {
-                "no_prezzo": "Non trovato",
-                "errore_prezzo": "Errore",
-                "skip_llm": "—",
-                "errore_llm": "—",
-            }
-            ebay_text = status_labels.get(status, "—")
-
-        # Colonna 3: Margine
-        if market > 0:
-            margin_text = f"{margin:+.0f}%"
-            if status == "deal":
-                margin_text += " DEAL"
-        else:
-            margin_text = "—"
-
         row_widgets: list[tk.Widget] = []
 
-        # Label annuncio
-        lbl_annuncio = ctk.CTkLabel(
-            self.analysis_scroll, text=annuncio_text,
-            font=ctk.CTkFont(size=12), text_color=color,
-            anchor="w",
+        # Colonna 1: Prezzo Subito/sorgente (prodotto + prezzo chiesto)
+        col1_text = f"[{platform}] {product}\n{asked:.0f} EUR"
+        lbl_subito = ctk.CTkLabel(
+            self.analysis_scroll, text=col1_text,
+            font=ctk.CTkFont(size=11), text_color=color, anchor="w", justify="left",
         )
-        lbl_annuncio.grid(row=row_idx, column=0, padx=6, pady=2, sticky="w")
-        row_widgets.append(lbl_annuncio)
+        lbl_subito.grid(row=row_idx, column=0, padx=6, pady=2, sticky="w")
+        row_widgets.append(lbl_subito)
 
-        # Label eBay
+        # Colonna 2: Prezzo eBay (inserzioni attive)
+        if active_median > 0:
+            col2_text = f"{active_median:.0f} EUR\n({active_count} attivi)"
+        elif market > 0:
+            col2_text = f"{market:.0f} EUR"
+        else:
+            error_labels = {
+                "no_prezzo": "Non trovato", "errore_prezzo": "Errore",
+                "skip_llm": "—", "errore_llm": "—",
+            }
+            col2_text = error_labels.get(status, "—")
         lbl_ebay = ctk.CTkLabel(
-            self.analysis_scroll, text=ebay_text,
-            font=ctk.CTkFont(size=12),
-            text_color=("gray90", "gray90") if market > 0 else "gray60",
+            self.analysis_scroll, text=col2_text,
+            font=ctk.CTkFont(size=11),
+            text_color=("gray90", "gray90") if (active_median > 0 or market > 0) else "gray60",
+            anchor="w", justify="left",
         )
         lbl_ebay.grid(row=row_idx, column=1, padx=6, pady=2, sticky="w")
         row_widgets.append(lbl_ebay)
 
-        # Label margine
+        # Colonna 3: Media venduti (mediana oggetti venduti)
+        if market > 0:
+            col3_text = f"{market:.0f} EUR\n({sold} venduti)"
+        else:
+            col3_text = "—"
+        lbl_sold = ctk.CTkLabel(
+            self.analysis_scroll, text=col3_text,
+            font=ctk.CTkFont(size=11),
+            text_color=("gray90", "gray90") if market > 0 else "gray60",
+            anchor="w", justify="left",
+        )
+        lbl_sold.grid(row=row_idx, column=2, padx=6, pady=2, sticky="w")
+        row_widgets.append(lbl_sold)
+
+        # Colonna 4: Margine (% + piattaforma guadagno)
+        if market > 0:
+            margin_text = f"{margin:+.0f}%"
+            if status == "deal":
+                margin_text += f"\n{platform}"
+        else:
+            margin_text = "—"
         margin_color = color if market > 0 else "gray60"
         lbl_margin = ctk.CTkLabel(
             self.analysis_scroll, text=margin_text,
-            font=ctk.CTkFont(size=12, weight="bold" if status == "deal" else "normal"),
-            text_color=margin_color,
+            font=ctk.CTkFont(size=11, weight="bold" if status == "deal" else "normal"),
+            text_color=margin_color, anchor="w", justify="left",
         )
-        lbl_margin.grid(row=row_idx, column=2, padx=6, pady=2, sticky="w")
+        lbl_margin.grid(row=row_idx, column=3, padx=6, pady=2, sticky="w")
         row_widgets.append(lbl_margin)
 
-        # Bottone link
+        # Colonna 5: Link
         if url:
             btn_link = ctk.CTkButton(
                 self.analysis_scroll, text="Apri",
@@ -363,14 +373,14 @@ class DealFinderApp(ctk.CTk):
                 fg_color=("gray70", "gray30"), hover_color=("gray60", "gray40"),
                 command=lambda u=url: webbrowser.open(u),
             )
-            btn_link.grid(row=row_idx, column=3, padx=6, pady=2, sticky="w")
+            btn_link.grid(row=row_idx, column=4, padx=6, pady=2, sticky="w")
             row_widgets.append(btn_link)
         else:
             lbl_no_link = ctk.CTkLabel(
                 self.analysis_scroll, text="—",
-                font=ctk.CTkFont(size=12), text_color="gray60",
+                font=ctk.CTkFont(size=11), text_color="gray60",
             )
-            lbl_no_link.grid(row=row_idx, column=3, padx=6, pady=2, sticky="w")
+            lbl_no_link.grid(row=row_idx, column=4, padx=6, pady=2, sticky="w")
             row_widgets.append(lbl_no_link)
 
         self._analysis_rows.append(row_widgets)

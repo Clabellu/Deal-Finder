@@ -63,6 +63,9 @@ class PriceResult:
     max_price: float
     sold_count: int
     reliable: bool  # True se sold_count >= 5
+    # Prezzo mediano inserzioni attive eBay (0 se non disponibile)
+    active_median: float = 0
+    active_count: int = 0
 
 
 class PriceChecker:
@@ -145,57 +148,62 @@ class PriceChecker:
         if short_query != clean_query:
             attempts.append((short_query, ""))
 
-        prices: list[float] = []
+        sold_prices: list[float] = []
+        active_prices: list[float] = []
         used_query = clean_query
-        from_active = False
 
         # --- Fase 1: scraping venduti ---
         for query, cond in attempts:
             result = await self._get_prices_cached(query, cond, sold=True)
             if result:
-                prices = result
+                sold_prices = result
                 used_query = query
                 break
             logger.debug("Scraping venduti: niente per '%s' (cond='%s')", query, cond)
 
-        # --- Fase 2: scraping inserzioni attive ---
-        if not prices:
-            logger.info("Nessun venduto trovato per '%s', cerco inserzioni attive", search_query)
-            for query, cond in attempts:
-                result = await self._get_prices_cached(query, cond, sold=False)
-                if result:
-                    prices = result
+        # --- Fase 2: scraping inserzioni attive (sempre, per mostrare prezzo eBay) ---
+        for query, cond in attempts:
+            result = await self._get_prices_cached(query, cond, sold=False)
+            if result:
+                active_prices = result
+                if not sold_prices:
                     used_query = query
-                    from_active = True
-                    logger.info(
-                        "Trovati %d prezzi da inserzioni attive per '%s'",
-                        len(prices), query,
-                    )
-                    break
+                logger.debug(
+                    "Trovati %d prezzi da inserzioni attive per '%s'",
+                    len(active_prices), query,
+                )
+                break
 
         # --- Fase 3: API come ultima risorsa (opzionale) ---
-        if not prices and self._app_id:
+        if not sold_prices and not active_prices and self._app_id:
             logger.info("Scraping fallito per '%s', provo API eBay", search_query)
             for query, cond in attempts:
                 result = await self._try_api(query, cond)
                 if result:
-                    prices = result
+                    sold_prices = result
                     used_query = query
                     break
+
+        # Usa venduti come riferimento principale, attivi come fallback
+        prices = sold_prices if sold_prices else active_prices
+        from_active = not sold_prices and bool(active_prices)
 
         if not prices:
             logger.warning("Nessun prezzo trovato su eBay per: %s", search_query)
             return None
 
         # Filtra outlier (prezzi sotto il 10% della mediana)
-        raw_median = statistics.median(prices)
-        threshold = raw_median * 0.10
-        filtered = [p for p in prices if p >= threshold]
-        if not filtered:
-            filtered = prices
-
+        filtered = self._filter_outliers(prices)
         median_price = statistics.median(filtered)
         mean_price = statistics.mean(filtered)
+
+        # Calcola anche mediana inserzioni attive (se disponibili)
+        active_median = 0.0
+        active_count = 0
+        if active_prices:
+            active_filtered = self._filter_outliers(active_prices)
+            active_median = round(statistics.median(active_filtered), 2)
+            active_count = len(active_filtered)
 
         # Inserzioni attive: servono piu' campioni per essere affidabili
         min_reliable = 5 if not from_active else 8
@@ -207,6 +215,8 @@ class PriceChecker:
             max_price=round(max(filtered), 2),
             sold_count=len(filtered),
             reliable=len(filtered) >= min_reliable,
+            active_median=active_median,
+            active_count=active_count,
         )
 
         source = "attive" if from_active else "venduti"
@@ -220,6 +230,14 @@ class PriceChecker:
             result.reliable,
         )
         return result
+
+    @staticmethod
+    def _filter_outliers(prices: list[float]) -> list[float]:
+        """Filtra outlier (prezzi sotto il 10% della mediana)."""
+        raw_median = statistics.median(prices)
+        threshold = raw_median * 0.10
+        filtered = [p for p in prices if p >= threshold]
+        return filtered if filtered else prices
 
     # ------------------------------------------------------------------ #
     #  Query cleaning                                                      #
