@@ -16,6 +16,7 @@ from notifier.telegram_bot import TelegramNotifier
 from scrapers.base_scraper import BaseScraper
 from scrapers.subito import SubitoScraper
 from scrapers.ebay import EbayScraper
+from scrapers.vinted import VintedScraper
 from utils.logger import get_logger
 
 load_dotenv()
@@ -25,6 +26,7 @@ logger = get_logger("engine")
 _SCRAPER_REGISTRY: dict[str, type[BaseScraper]] = {
     "subito": SubitoScraper,
     "ebay": EbayScraper,
+    "vinted": VintedScraper,
 }
 
 

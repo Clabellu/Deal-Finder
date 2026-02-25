@@ -11,7 +11,7 @@ max_listings_per_cycle: 20
 platforms:
   - subito
   - ebay
-  # - vinted      # decommentare quando pronto
+  - vinted
   # - wallapop    # decommentare quando pronto
 
 # Categorie da monitorare
