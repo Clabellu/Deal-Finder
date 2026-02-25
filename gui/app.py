@@ -4,6 +4,7 @@ import asyncio
 import os
 import threading
 import tkinter as tk
+import webbrowser
 from datetime import datetime, timezone
 from tkinter import messagebox
 
@@ -242,31 +243,31 @@ class DealFinderApp(ctk.CTk):
             dot.pack(side="left", padx=(0, 2))
             ctk.CTkLabel(legend, text=text, text_color="gray60", font=ctk.CTkFont(size=11)).pack(side="left", padx=(0, 12))
 
-        # Tabella
+        # Tabella analisi — 4 colonne come richiesto
         self.analysis_scroll = ctk.CTkScrollableFrame(frame)
         self.analysis_scroll.pack(fill="both", expand=True)
 
-        # Configurazione colonne: Prodotto | Prezzo | eBay | Margine | Venduti | Stato
-        col_weights = [3, 1, 1, 1, 1, 1]
+        # Colonne: Annuncio (Subito/eBay) | Prezzo eBay venduti | Margine | Link
+        col_weights = [4, 2, 2, 1]
         for i, w in enumerate(col_weights):
             self.analysis_scroll.columnconfigure(i, weight=w)
 
-        headers = ["Prodotto", "Prezzo", "eBay", "Margine", "Venduti", "Stato"]
+        headers = ["Annuncio", "Media eBay venduti", "Margine", "Link"]
         for i, h in enumerate(headers):
             ctk.CTkLabel(
                 self.analysis_scroll, text=h,
                 font=ctk.CTkFont(size=12, weight="bold"), text_color="gray60",
             ).grid(row=0, column=i, padx=6, pady=4, sticky="w")
 
-        self._analysis_rows: list[list[ctk.CTkLabel]] = []
+        self._analysis_rows: list[list[tk.Widget]] = []
         self._analysis_row_count = 0
 
         return frame
 
     def _clear_analysis(self):
         for row in self._analysis_rows:
-            for lbl in row:
-                lbl.destroy()
+            for widget in row:
+                widget.destroy()
         self._analysis_rows.clear()
         self._analysis_row_count = 0
 
@@ -283,47 +284,96 @@ class DealFinderApp(ctk.CTk):
         market = data.get("market_price", 0)
         margin = data.get("margin_percent", 0)
         sold = data.get("sold_count", 0)
+        platform = data.get("platform", "").capitalize()
+        product = data.get("product_name", "—")[:40]
+        url = data.get("url", "")
 
-        # Determina colore e testo stato
-        status_map = {
-            "deal":         ("#2ea043", "DEAL"),
-            "sotto_soglia": ("#d29922", f"Sotto soglia"),
-            "no_prezzo":    ("#8b949e", "No prezzo"),
-            "errore_prezzo": ("#8b949e", "Errore prezzo"),
-            "skip_llm":     ("#6e7681", "Skip LLM"),
-            "errore_llm":   ("#6e7681", "Errore LLM"),
+        # Determina colore in base allo stato
+        status_colors = {
+            "deal":         "#2ea043",
+            "sotto_soglia": "#d29922",
+            "no_prezzo":    "#8b949e",
+            "errore_prezzo": "#8b949e",
+            "skip_llm":     "#6e7681",
+            "errore_llm":   "#6e7681",
         }
-        color, status_text = status_map.get(status, ("#8b949e", status))
-
-        # Margine negativo -> rosso
+        color = status_colors.get(status, "#8b949e")
         if market > 0 and margin < 0:
             color = "#d73a49"
 
-        # Formatta valori
-        market_str = f"{market:.0f} EUR" if market > 0 else "—"
-        margin_str = f"{margin:+.0f}%" if market > 0 else "—"
-        sold_str = str(sold) if sold > 0 else "—"
+        # Colonna 1: Annuncio (piattaforma + prodotto + prezzo chiesto)
+        annuncio_text = f"[{platform}] {product} — {asked:.0f} EUR"
 
-        values = [
-            data.get("product_name", "—")[:45],
-            f"{asked:.0f} EUR",
-            market_str,
-            margin_str,
-            sold_str,
-            status_text,
-        ]
+        # Colonna 2: Media eBay venduti
+        if market > 0:
+            ebay_text = f"{market:.0f} EUR ({sold} venduti)"
+        else:
+            status_labels = {
+                "no_prezzo": "Non trovato",
+                "errore_prezzo": "Errore",
+                "skip_llm": "—",
+                "errore_llm": "—",
+            }
+            ebay_text = status_labels.get(status, "—")
 
-        row_labels = []
-        for j, val in enumerate(values):
-            text_color = color if j == 5 or (j == 3 and market > 0) else ("gray90", "gray90")
-            lbl = ctk.CTkLabel(
-                self.analysis_scroll, text=val,
-                font=ctk.CTkFont(size=12),
-                text_color=text_color,
+        # Colonna 3: Margine
+        if market > 0:
+            margin_text = f"{margin:+.0f}%"
+            if status == "deal":
+                margin_text += " DEAL"
+        else:
+            margin_text = "—"
+
+        row_widgets: list[tk.Widget] = []
+
+        # Label annuncio
+        lbl_annuncio = ctk.CTkLabel(
+            self.analysis_scroll, text=annuncio_text,
+            font=ctk.CTkFont(size=12), text_color=color,
+            anchor="w",
+        )
+        lbl_annuncio.grid(row=row_idx, column=0, padx=6, pady=2, sticky="w")
+        row_widgets.append(lbl_annuncio)
+
+        # Label eBay
+        lbl_ebay = ctk.CTkLabel(
+            self.analysis_scroll, text=ebay_text,
+            font=ctk.CTkFont(size=12),
+            text_color=("gray90", "gray90") if market > 0 else "gray60",
+        )
+        lbl_ebay.grid(row=row_idx, column=1, padx=6, pady=2, sticky="w")
+        row_widgets.append(lbl_ebay)
+
+        # Label margine
+        margin_color = color if market > 0 else "gray60"
+        lbl_margin = ctk.CTkLabel(
+            self.analysis_scroll, text=margin_text,
+            font=ctk.CTkFont(size=12, weight="bold" if status == "deal" else "normal"),
+            text_color=margin_color,
+        )
+        lbl_margin.grid(row=row_idx, column=2, padx=6, pady=2, sticky="w")
+        row_widgets.append(lbl_margin)
+
+        # Bottone link
+        if url:
+            btn_link = ctk.CTkButton(
+                self.analysis_scroll, text="Apri",
+                width=50, height=24, corner_radius=4,
+                font=ctk.CTkFont(size=11),
+                fg_color=("gray70", "gray30"), hover_color=("gray60", "gray40"),
+                command=lambda u=url: webbrowser.open(u),
             )
-            lbl.grid(row=row_idx, column=j, padx=6, pady=2, sticky="w")
-            row_labels.append(lbl)
-        self._analysis_rows.append(row_labels)
+            btn_link.grid(row=row_idx, column=3, padx=6, pady=2, sticky="w")
+            row_widgets.append(btn_link)
+        else:
+            lbl_no_link = ctk.CTkLabel(
+                self.analysis_scroll, text="—",
+                font=ctk.CTkFont(size=12), text_color="gray60",
+            )
+            lbl_no_link.grid(row=row_idx, column=3, padx=6, pady=2, sticky="w")
+            row_widgets.append(lbl_no_link)
+
+        self._analysis_rows.append(row_widgets)
 
     # ── Categorie ───────────────────────────────────────────
 

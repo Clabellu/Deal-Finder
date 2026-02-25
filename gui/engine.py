@@ -114,6 +114,7 @@ class MonitorEngine:
         margin_percent: float = 0,
         sold_count: int = 0,
         status: str = "",
+        url: str = "",
     ) -> None:
         if self.on_listing_analyzed:
             self.on_listing_analyzed({
@@ -125,6 +126,7 @@ class MonitorEngine:
                 "margin_percent": margin_percent,
                 "sold_count": sold_count,
                 "status": status,
+                "url": url,
             })
 
     def _run_loop(self) -> None:
@@ -297,11 +299,17 @@ class MonitorEngine:
                         try:
                             parsed = await parser.parse_listing(listing)
                         except Exception:
-                            self._emit_analysis(listing.title, listing.price, platform_name, status="errore_llm")
+                            self._emit_analysis(
+                                listing.title, listing.price, platform_name,
+                                status="errore_llm", url=listing.url,
+                            )
                             continue
 
                         if parsed is None:
-                            self._emit_analysis(listing.title, listing.price, platform_name, status="skip_llm")
+                            self._emit_analysis(
+                                listing.title, listing.price, platform_name,
+                                status="skip_llm", url=listing.url,
+                            )
                             continue
 
                         try:
@@ -311,14 +319,16 @@ class MonitorEngine:
                         except Exception:
                             self._emit_analysis(
                                 parsed.product_name, listing.price, platform_name,
-                                ebay_query=parsed.ebay_search_query, status="errore_prezzo",
+                                ebay_query=parsed.ebay_search_query,
+                                status="errore_prezzo", url=listing.url,
                             )
                             continue
 
                         if price_result is None:
                             self._emit_analysis(
                                 parsed.product_name, listing.price, platform_name,
-                                ebay_query=parsed.ebay_search_query, status="no_prezzo",
+                                ebay_query=parsed.ebay_search_query,
+                                status="no_prezzo", url=listing.url,
                             )
                             continue
 
@@ -332,6 +342,7 @@ class MonitorEngine:
                                 ebay_query=parsed.ebay_search_query,
                                 market_price=reference_price, margin_percent=margin_percent,
                                 sold_count=price_result.sold_count, status="sotto_soglia",
+                                url=listing.url,
                             )
                             continue
 
@@ -341,6 +352,7 @@ class MonitorEngine:
                             ebay_query=parsed.ebay_search_query,
                             market_price=reference_price, margin_percent=margin_percent,
                             sold_count=price_result.sold_count, status="deal",
+                            url=listing.url,
                         )
 
                         try:
