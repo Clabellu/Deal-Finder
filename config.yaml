@@ -33,6 +33,15 @@ categories:
     min_price: 100
     max_price: 600
 
+  - name: "Sneakers"
+    keywords:
+      - "nike air jordan"
+      - "nike dunk"
+      - "new balance 550"
+      - "adidas yeezy"
+    min_price: 40
+    max_price: 500
+
 # Configurazione LLM
 llm:
   model: "claude-haiku-4-5-20251001"

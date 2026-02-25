@@ -244,16 +244,16 @@ class DealFinderApp(ctk.CTk):
             dot.pack(side="left", padx=(0, 2))
             ctk.CTkLabel(legend, text=text, text_color="gray60", font=ctk.CTkFont(size=11)).pack(side="left", padx=(0, 12))
 
-        # Tabella analisi — 5 colonne
+        # Tabella analisi — 6 colonne
         self.analysis_scroll = ctk.CTkScrollableFrame(frame)
         self.analysis_scroll.pack(fill="both", expand=True)
 
-        # Colonne: Prezzo Subito | Prezzo eBay | Media venduti | Margine | Link
-        col_weights = [3, 2, 2, 2, 1]
+        # Colonne: Annuncio | eBay | Vinted | Media venduti | Margine | Link
+        col_weights = [3, 2, 2, 2, 2, 1]
         for i, w in enumerate(col_weights):
             self.analysis_scroll.columnconfigure(i, weight=w)
 
-        headers = ["Prezzo Subito", "Prezzo eBay", "Media venduti", "Margine", "Link"]
+        headers = ["Annuncio", "Prezzo eBay", "Prezzo Vinted", "Media venduti", "Margine", "Link"]
         for i, h in enumerate(headers):
             ctk.CTkLabel(
                 self.analysis_scroll, text=h,
@@ -290,29 +290,25 @@ class DealFinderApp(ctk.CTk):
         url = data.get("url", "")
         active_median = data.get("active_median", 0)
         active_count = data.get("active_count", 0)
+        vinted_median = data.get("vinted_median", 0)
+        vinted_count = data.get("vinted_count", 0)
         ebay_query = data.get("ebay_query", "")
 
-        # Confronto piattaforme: determina quale e' piu' conveniente
-        best_price = asked
-        best_platform = platform
-        best_url = url
+        # Confronto a 3 piattaforme: trova la piu' conveniente
+        candidates = []
+        if asked > 0:
+            candidates.append((asked, platform, url))
+        if active_median > 0:
+            ebay_url = f"https://www.ebay.it/sch/i.html?_nkw={quote(ebay_query)}&LH_BIN=1" if ebay_query else ""
+            candidates.append((active_median, "eBay", ebay_url))
+        if vinted_median > 0:
+            vinted_url = f"https://www.vinted.it/catalog?search_text={quote(ebay_query)}" if ebay_query else ""
+            candidates.append((vinted_median, "Vinted", vinted_url))
 
-        if active_median > 0 and asked > 0:
-            if active_median < asked:
-                # eBay e' piu' conveniente
-                best_price = active_median
-                best_platform = "eBay"
-                if ebay_query:
-                    best_url = f"https://www.ebay.it/sch/i.html?_nkw={quote(ebay_query)}&LH_BIN=1"
-            else:
-                # Subito/sorgente e' piu' conveniente
-                best_platform = platform
-                best_url = url
-        elif active_median > 0 and asked == 0:
-            best_price = active_median
-            best_platform = "eBay"
-            if ebay_query:
-                best_url = f"https://www.ebay.it/sch/i.html?_nkw={quote(ebay_query)}&LH_BIN=1"
+        if candidates:
+            best_price, best_platform, best_url = min(candidates, key=lambda x: x[0])
+        else:
+            best_price, best_platform, best_url = asked, platform, url
 
         # Ricalcola margine rispetto al prezzo piu' conveniente
         if market > 0 and best_price > 0:
@@ -335,14 +331,14 @@ class DealFinderApp(ctk.CTk):
 
         row_widgets: list[tk.Widget] = []
 
-        # Colonna 1: Prezzo Subito/sorgente (prodotto + prezzo chiesto)
+        # Colonna 1: Annuncio (piattaforma sorgente + prodotto + prezzo)
         col1_text = f"[{platform}] {product}\n{asked:.0f} EUR"
-        lbl_subito = ctk.CTkLabel(
+        lbl_source = ctk.CTkLabel(
             self.analysis_scroll, text=col1_text,
             font=ctk.CTkFont(size=11), text_color=color, anchor="w", justify="left",
         )
-        lbl_subito.grid(row=row_idx, column=0, padx=6, pady=2, sticky="w")
-        row_widgets.append(lbl_subito)
+        lbl_source.grid(row=row_idx, column=0, padx=6, pady=2, sticky="w")
+        row_widgets.append(lbl_source)
 
         # Colonna 2: Prezzo eBay (inserzioni attive)
         if active_median > 0:
@@ -362,21 +358,35 @@ class DealFinderApp(ctk.CTk):
         lbl_ebay.grid(row=row_idx, column=1, padx=6, pady=2, sticky="w")
         row_widgets.append(lbl_ebay)
 
-        # Colonna 3: Media venduti (mediana oggetti venduti)
-        if market > 0:
-            col3_text = f"{market:.0f} EUR\n({sold} venduti)"
+        # Colonna 3: Prezzo Vinted
+        if vinted_median > 0:
+            col3_text = f"{vinted_median:.0f} EUR\n({vinted_count} annunci)"
         else:
             col3_text = "—"
-        lbl_sold = ctk.CTkLabel(
+        lbl_vinted = ctk.CTkLabel(
             self.analysis_scroll, text=col3_text,
+            font=ctk.CTkFont(size=11),
+            text_color=("gray90", "gray90") if vinted_median > 0 else "gray60",
+            anchor="w", justify="left",
+        )
+        lbl_vinted.grid(row=row_idx, column=2, padx=6, pady=2, sticky="w")
+        row_widgets.append(lbl_vinted)
+
+        # Colonna 4: Media venduti (mediana oggetti venduti eBay)
+        if market > 0:
+            col4_text = f"{market:.0f} EUR\n({sold} venduti)"
+        else:
+            col4_text = "—"
+        lbl_sold = ctk.CTkLabel(
+            self.analysis_scroll, text=col4_text,
             font=ctk.CTkFont(size=11),
             text_color=("gray90", "gray90") if market > 0 else "gray60",
             anchor="w", justify="left",
         )
-        lbl_sold.grid(row=row_idx, column=2, padx=6, pady=2, sticky="w")
+        lbl_sold.grid(row=row_idx, column=3, padx=6, pady=2, sticky="w")
         row_widgets.append(lbl_sold)
 
-        # Colonna 4: Margine (% + piattaforma piu' conveniente)
+        # Colonna 5: Margine (% + piattaforma piu' conveniente)
         if market > 0:
             margin_text = f"{real_margin:+.0f}%\n{best_platform}"
         else:
@@ -387,12 +397,12 @@ class DealFinderApp(ctk.CTk):
             font=ctk.CTkFont(size=11, weight="bold" if real_margin > 0 and market > 0 else "normal"),
             text_color=margin_color, anchor="w", justify="left",
         )
-        lbl_margin.grid(row=row_idx, column=3, padx=6, pady=2, sticky="w")
+        lbl_margin.grid(row=row_idx, column=4, padx=6, pady=2, sticky="w")
         row_widgets.append(lbl_margin)
 
-        # Colonna 5: Link (alla piattaforma piu' conveniente)
+        # Colonna 6: Link (alla piattaforma piu' conveniente)
         if best_url:
-            link_label = best_platform if market > 0 and active_median > 0 else "Apri"
+            link_label = best_platform if market > 0 and len(candidates) > 1 else "Apri"
             btn_link = ctk.CTkButton(
                 self.analysis_scroll, text=link_label,
                 width=60, height=24, corner_radius=4,
@@ -400,14 +410,14 @@ class DealFinderApp(ctk.CTk):
                 fg_color=("gray70", "gray30"), hover_color=("gray60", "gray40"),
                 command=lambda u=best_url: webbrowser.open(u),
             )
-            btn_link.grid(row=row_idx, column=4, padx=6, pady=2, sticky="w")
+            btn_link.grid(row=row_idx, column=5, padx=6, pady=2, sticky="w")
             row_widgets.append(btn_link)
         else:
             lbl_no_link = ctk.CTkLabel(
                 self.analysis_scroll, text="—",
                 font=ctk.CTkFont(size=11), text_color="gray60",
             )
-            lbl_no_link.grid(row=row_idx, column=4, padx=6, pady=2, sticky="w")
+            lbl_no_link.grid(row=row_idx, column=5, padx=6, pady=2, sticky="w")
             row_widgets.append(lbl_no_link)
 
         self._analysis_rows.append(row_widgets)
@@ -569,7 +579,7 @@ class DealFinderApp(ctk.CTk):
         platforms_frame.pack(fill="x", padx=20)
 
         self.platform_vars: dict[str, ctk.BooleanVar] = {}
-        for plat in ["subito", "ebay"]:
+        for plat in ["subito", "ebay", "vinted"]:
             var = ctk.BooleanVar(value=False)
             self.platform_vars[plat] = var
             ctk.CTkCheckBox(platforms_frame, text=plat.capitalize(), variable=var).pack(side="left", padx=(0, 20))

@@ -1,11 +1,13 @@
 """Wrapper per il motore di monitoraggio che gira in un thread separato."""
 
 import asyncio
+import random
 import threading
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
 import yaml
+from curl_cffi.requests import AsyncSession as CurlAsyncSession
 from dotenv import load_dotenv
 
 from analyzer.llm_parser import LLMParser
@@ -29,6 +31,18 @@ _SCRAPER_REGISTRY: dict[str, type[BaseScraper]] = {
     "vinted": VintedScraper,
 }
 
+# Vinted price lookup
+_VINTED_API_URL = "https://www.vinted.it/api/v2/catalog/items"
+_VINTED_HEADERS = {
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
+    "DNT": "1",
+    "Connection": "keep-alive",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+}
+
 
 class MonitorEngine:
     """Gestisce il ciclo di monitoraggio in un thread separato."""
@@ -42,6 +56,8 @@ class MonitorEngine:
         self._started_at: Optional[datetime] = None
         self._cycle_count = 0
         self._deals_found = 0
+        self._vinted_price_cache: dict[str, tuple[float, int]] = {}
+        self._vinted_session: Optional[CurlAsyncSession] = None
 
         # Callbacks per aggiornare la GUI (thread-safe tramite root.after)
         self.on_status_change: Optional[Callable[[str], None]] = None
@@ -119,6 +135,8 @@ class MonitorEngine:
         url: str = "",
         active_median: float = 0,
         active_count: int = 0,
+        vinted_median: float = 0,
+        vinted_count: int = 0,
     ) -> None:
         if self.on_listing_analyzed:
             self.on_listing_analyzed({
@@ -133,7 +151,93 @@ class MonitorEngine:
                 "url": url,
                 "active_median": active_median,
                 "active_count": active_count,
+                "vinted_median": vinted_median,
+                "vinted_count": vinted_count,
             })
+
+    async def _init_vinted_session(self) -> bool:
+        """Inizializza la sessione Vinted visitando la homepage per i cookie."""
+        try:
+            self._vinted_session = CurlAsyncSession(
+                headers=_VINTED_HEADERS,
+                impersonate="chrome131",
+                timeout=30,
+            )
+            resp = await self._vinted_session.get("https://www.vinted.it/")
+            if resp.status_code == 200:
+                logger.info("Sessione Vinted inizializzata per lookup prezzi")
+                await asyncio.sleep(random.uniform(0.5, 1.5))
+                return True
+            logger.warning("Vinted homepage HTTP %d", resp.status_code)
+        except Exception as e:
+            logger.warning("Errore init sessione Vinted: %s", e)
+            self._vinted_session = None
+        return False
+
+    async def _lookup_vinted_price(self, query: str) -> tuple[float, int]:
+        """Cerca il prezzo mediano su Vinted per una query. Usa cache."""
+        cache_key = query.lower().strip()
+        if cache_key in self._vinted_price_cache:
+            return self._vinted_price_cache[cache_key]
+
+        if not self._vinted_session:
+            return (0.0, 0)
+
+        try:
+            resp = await self._vinted_session.get(_VINTED_API_URL, params={
+                "search_text": query,
+                "per_page": "20",
+                "page": "1",
+                "order": "relevance",
+                "currency": "EUR",
+            })
+            if resp.status_code == 401:
+                logger.info("Vinted sessione scaduta, reinizializzo...")
+                if await self._init_vinted_session():
+                    resp = await self._vinted_session.get(_VINTED_API_URL, params={
+                        "search_text": query,
+                        "per_page": "20",
+                        "page": "1",
+                        "order": "relevance",
+                        "currency": "EUR",
+                    })
+                else:
+                    result = (0.0, 0)
+                    self._vinted_price_cache[cache_key] = result
+                    return result
+
+            if resp.status_code != 200:
+                result = (0.0, 0)
+                self._vinted_price_cache[cache_key] = result
+                return result
+
+            data = resp.json()
+            items = data.get("items", [])
+            prices = []
+            for item in items:
+                try:
+                    p = float(str(item.get("price", "0")).replace(",", "."))
+                    if p > 0:
+                        prices.append(p)
+                except (ValueError, TypeError):
+                    continue
+
+            if prices:
+                prices.sort()
+                median = prices[len(prices) // 2]
+                result = (median, len(prices))
+                logger.info(
+                    "Vinted lookup '%s': %d prezzi (mediana %.0f)",
+                    query, len(prices), median,
+                )
+            else:
+                result = (0.0, 0)
+        except Exception as e:
+            logger.debug("Errore Vinted lookup per '%s': %s", query, e)
+            result = (0.0, 0)
+
+        self._vinted_price_cache[cache_key] = result
+        return result
 
     def _run_loop(self) -> None:
         """Entrypoint del thread: crea un event loop e avvia il ciclo async."""
@@ -207,6 +311,10 @@ class MonitorEngine:
             await bot.start()
         except Exception:
             self._emit_log("Bot Telegram non avviato (continuo senza)")
+
+        # Inizializza sessione Vinted per lookup prezzi
+        await self._init_vinted_session()
+        self._vinted_price_cache.clear()
 
         polling_interval = config.get("polling_interval", 300)
 
@@ -338,6 +446,16 @@ class MonitorEngine:
                             )
                             continue
 
+                        # Lookup prezzo Vinted per confronto a 3
+                        vinted_med, vinted_cnt = 0.0, 0
+                        if listing.platform == "vinted":
+                            vinted_med = listing.price
+                            vinted_cnt = 1
+                        else:
+                            vinted_med, vinted_cnt = await self._lookup_vinted_price(
+                                parsed.ebay_search_query
+                            )
+
                         reference_price = price_result.median_price
                         margin = reference_price - listing.price
                         margin_percent = (margin / listing.price * 100) if listing.price > 0 else 0
@@ -351,6 +469,8 @@ class MonitorEngine:
                                 url=listing.url,
                                 active_median=price_result.active_median,
                                 active_count=price_result.active_count,
+                                vinted_median=vinted_med,
+                                vinted_count=vinted_cnt,
                             )
                             continue
 
@@ -363,6 +483,8 @@ class MonitorEngine:
                             url=listing.url,
                             active_median=price_result.active_median,
                             active_count=price_result.active_count,
+                            vinted_median=vinted_med,
+                            vinted_count=vinted_cnt,
                         )
 
                         try:
