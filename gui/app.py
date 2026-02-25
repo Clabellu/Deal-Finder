@@ -7,6 +7,7 @@ import tkinter as tk
 import webbrowser
 from datetime import datetime, timezone
 from tkinter import messagebox
+from urllib.parse import quote
 
 import yaml
 from dotenv import load_dotenv
@@ -289,6 +290,35 @@ class DealFinderApp(ctk.CTk):
         url = data.get("url", "")
         active_median = data.get("active_median", 0)
         active_count = data.get("active_count", 0)
+        ebay_query = data.get("ebay_query", "")
+
+        # Confronto piattaforme: determina quale e' piu' conveniente
+        best_price = asked
+        best_platform = platform
+        best_url = url
+
+        if active_median > 0 and asked > 0:
+            if active_median < asked:
+                # eBay e' piu' conveniente
+                best_price = active_median
+                best_platform = "eBay"
+                if ebay_query:
+                    best_url = f"https://www.ebay.it/sch/i.html?_nkw={quote(ebay_query)}&LH_BIN=1"
+            else:
+                # Subito/sorgente e' piu' conveniente
+                best_platform = platform
+                best_url = url
+        elif active_median > 0 and asked == 0:
+            best_price = active_median
+            best_platform = "eBay"
+            if ebay_query:
+                best_url = f"https://www.ebay.it/sch/i.html?_nkw={quote(ebay_query)}&LH_BIN=1"
+
+        # Ricalcola margine rispetto al prezzo piu' conveniente
+        if market > 0 and best_price > 0:
+            real_margin = (market - best_price) / best_price * 100
+        else:
+            real_margin = margin
 
         # Determina colore in base allo stato
         status_colors = {
@@ -300,7 +330,7 @@ class DealFinderApp(ctk.CTk):
             "errore_llm":   "#6e7681",
         }
         color = status_colors.get(status, "#8b949e")
-        if market > 0 and margin < 0:
+        if market > 0 and real_margin < 0:
             color = "#d73a49"
 
         row_widgets: list[tk.Widget] = []
@@ -317,8 +347,6 @@ class DealFinderApp(ctk.CTk):
         # Colonna 2: Prezzo eBay (inserzioni attive)
         if active_median > 0:
             col2_text = f"{active_median:.0f} EUR\n({active_count} attivi)"
-        elif market > 0:
-            col2_text = f"{market:.0f} EUR"
         else:
             error_labels = {
                 "no_prezzo": "Non trovato", "errore_prezzo": "Errore",
@@ -328,7 +356,7 @@ class DealFinderApp(ctk.CTk):
         lbl_ebay = ctk.CTkLabel(
             self.analysis_scroll, text=col2_text,
             font=ctk.CTkFont(size=11),
-            text_color=("gray90", "gray90") if (active_median > 0 or market > 0) else "gray60",
+            text_color=("gray90", "gray90") if active_median > 0 else "gray60",
             anchor="w", justify="left",
         )
         lbl_ebay.grid(row=row_idx, column=1, padx=6, pady=2, sticky="w")
@@ -348,30 +376,29 @@ class DealFinderApp(ctk.CTk):
         lbl_sold.grid(row=row_idx, column=2, padx=6, pady=2, sticky="w")
         row_widgets.append(lbl_sold)
 
-        # Colonna 4: Margine (% + piattaforma guadagno)
+        # Colonna 4: Margine (% + piattaforma piu' conveniente)
         if market > 0:
-            margin_text = f"{margin:+.0f}%"
-            if status == "deal":
-                margin_text += f"\n{platform}"
+            margin_text = f"{real_margin:+.0f}%\n{best_platform}"
         else:
             margin_text = "—"
         margin_color = color if market > 0 else "gray60"
         lbl_margin = ctk.CTkLabel(
             self.analysis_scroll, text=margin_text,
-            font=ctk.CTkFont(size=11, weight="bold" if status == "deal" else "normal"),
+            font=ctk.CTkFont(size=11, weight="bold" if real_margin > 0 and market > 0 else "normal"),
             text_color=margin_color, anchor="w", justify="left",
         )
         lbl_margin.grid(row=row_idx, column=3, padx=6, pady=2, sticky="w")
         row_widgets.append(lbl_margin)
 
-        # Colonna 5: Link
-        if url:
+        # Colonna 5: Link (alla piattaforma piu' conveniente)
+        if best_url:
+            link_label = best_platform if market > 0 and active_median > 0 else "Apri"
             btn_link = ctk.CTkButton(
-                self.analysis_scroll, text="Apri",
-                width=50, height=24, corner_radius=4,
+                self.analysis_scroll, text=link_label,
+                width=60, height=24, corner_radius=4,
                 font=ctk.CTkFont(size=11),
                 fg_color=("gray70", "gray30"), hover_color=("gray60", "gray40"),
-                command=lambda u=url: webbrowser.open(u),
+                command=lambda u=best_url: webbrowser.open(u),
             )
             btn_link.grid(row=row_idx, column=4, padx=6, pady=2, sticky="w")
             row_widgets.append(btn_link)
