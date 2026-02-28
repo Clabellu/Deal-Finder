@@ -7,7 +7,6 @@ import tkinter as tk
 import webbrowser
 from datetime import datetime, timezone
 from tkinter import messagebox
-from urllib.parse import quote
 
 import yaml
 from dotenv import load_dotenv
@@ -273,151 +272,127 @@ class DealFinderApp(ctk.CTk):
         self._analysis_row_count = 0
 
     def _on_listing_analyzed(self, data: dict):
-        """Callback dal thread del motore per ogni inserzione analizzata."""
+        """Callback dal thread del motore per ogni keyword analizzata."""
         self.after(0, self._append_analysis_row, data)
 
     def _append_analysis_row(self, data: dict):
         self._analysis_row_count += 1
         row_idx = self._analysis_row_count
 
-        status = data.get("status", "")
-        asked = data.get("asked_price", 0)
-        market = data.get("market_price", 0)  # mediana venduti
-        margin = data.get("margin_percent", 0)
-        sold = data.get("sold_count", 0)
-        platform = data.get("platform", "").capitalize()
-        product = data.get("product_name", "—")[:35]
-        url = data.get("url", "")
-        active_median = data.get("active_median", 0)
-        active_count = data.get("active_count", 0)
+        keyword = data.get("keyword", "—")[:40]
+        subito_median = data.get("subito_median", 0)
+        subito_count = data.get("subito_count", 0)
+        subito_best_url = data.get("subito_best_url", "")
+        ebay_median = data.get("ebay_median", 0)
+        ebay_count = data.get("ebay_count", 0)
+        ebay_best_url = data.get("ebay_best_url", "")
         vinted_median = data.get("vinted_median", 0)
         vinted_count = data.get("vinted_count", 0)
-        ebay_query = data.get("ebay_query", "")
-
-        # Confronto a 3 piattaforme: trova la piu' conveniente
-        candidates = []
-        if asked > 0:
-            candidates.append((asked, platform, url))
-        if active_median > 0:
-            ebay_url = f"https://www.ebay.it/sch/i.html?_nkw={quote(ebay_query)}&LH_BIN=1" if ebay_query else ""
-            candidates.append((active_median, "eBay", ebay_url))
-        if vinted_median > 0:
-            vinted_url = f"https://www.vinted.it/catalog?search_text={quote(ebay_query)}" if ebay_query else ""
-            candidates.append((vinted_median, "Vinted", vinted_url))
-
-        if candidates:
-            best_price, best_platform, best_url = min(candidates, key=lambda x: x[0])
-        else:
-            best_price, best_platform, best_url = asked, platform, url
-
-        # Ricalcola margine rispetto al prezzo piu' conveniente
-        if market > 0 and best_price > 0:
-            real_margin = (market - best_price) / best_price * 100
-        else:
-            real_margin = margin
+        vinted_best_url = data.get("vinted_best_url", "")
+        market_price = data.get("market_price", 0)
+        sold_count = data.get("sold_count", 0)
+        margin_percent = data.get("margin_percent", 0)
+        best_platform = data.get("best_platform", "—")
+        best_price = data.get("best_price", 0)
+        best_url = data.get("best_url", "")
+        status = data.get("status", "")
 
         # Determina colore in base allo stato
         status_colors = {
             "deal":         "#2ea043",
             "sotto_soglia": "#d29922",
             "no_prezzo":    "#8b949e",
-            "errore_prezzo": "#8b949e",
-            "skip_llm":     "#6e7681",
-            "errore_llm":   "#6e7681",
         }
         color = status_colors.get(status, "#8b949e")
-        if market > 0 and real_margin < 0:
+        if market_price > 0 and margin_percent < 0:
             color = "#d73a49"
 
         row_widgets: list[tk.Widget] = []
 
-        # Colonna 0: Nome Prodotto (solo nome, senza platform e prezzo)
-        lbl_product = ctk.CTkLabel(
-            self.analysis_scroll, text=product,
+        # Colonna 0: Keyword / nome prodotto
+        lbl_kw = ctk.CTkLabel(
+            self.analysis_scroll, text=keyword,
             font=ctk.CTkFont(size=11), text_color=color, anchor="w", justify="left",
         )
-        lbl_product.grid(row=row_idx, column=0, padx=6, pady=2, sticky="w")
-        row_widgets.append(lbl_product)
+        lbl_kw.grid(row=row_idx, column=0, padx=6, pady=2, sticky="w")
+        row_widgets.append(lbl_kw)
 
-        # Colonna 1: Prezzo Subito (prezzo annuncio se proviene da Subito)
-        if data.get("platform", "").lower() == "subito" and asked > 0:
-            col_subito_text = f"{asked:.0f} EUR"
+        # Colonna 1: Prezzo Subito (mediana + numero annunci)
+        if subito_median > 0:
+            col_subito_text = f"{subito_median:.0f} EUR\n({subito_count} ann.)"
         else:
             col_subito_text = "—"
         lbl_subito = ctk.CTkLabel(
             self.analysis_scroll, text=col_subito_text,
             font=ctk.CTkFont(size=11),
-            text_color=color if col_subito_text != "—" else "gray60",
+            text_color="gray90" if subito_median > 0 else "gray60",
             anchor="w", justify="left",
         )
         lbl_subito.grid(row=row_idx, column=1, padx=6, pady=2, sticky="w")
         row_widgets.append(lbl_subito)
 
-        # Colonna 2: Prezzo eBay (inserzioni attive)
-        if active_median > 0:
-            col_ebay_text = f"{active_median:.0f} EUR\n({active_count} attivi)"
+        # Colonna 2: Prezzo eBay attivo (mediana + numero annunci)
+        if ebay_median > 0:
+            col_ebay_text = f"{ebay_median:.0f} EUR\n({ebay_count} ann.)"
         else:
-            error_labels = {
-                "no_prezzo": "Non trovato", "errore_prezzo": "Errore",
-                "skip_llm": "—", "errore_llm": "—",
-            }
-            col_ebay_text = error_labels.get(status, "—")
+            col_ebay_text = "Non trovato" if status == "no_prezzo" else "—"
         lbl_ebay = ctk.CTkLabel(
             self.analysis_scroll, text=col_ebay_text,
             font=ctk.CTkFont(size=11),
-            text_color=("gray90", "gray90") if active_median > 0 else "gray60",
+            text_color="gray90" if ebay_median > 0 else "gray60",
             anchor="w", justify="left",
         )
         lbl_ebay.grid(row=row_idx, column=2, padx=6, pady=2, sticky="w")
         row_widgets.append(lbl_ebay)
 
-        # Colonna 3: Prezzo Vinted
+        # Colonna 3: Prezzo Vinted (mediana + numero annunci)
         if vinted_median > 0:
-            col_vinted_text = f"{vinted_median:.0f} EUR\n({vinted_count} annunci)"
+            col_vinted_text = f"{vinted_median:.0f} EUR\n({vinted_count} ann.)"
         else:
             col_vinted_text = "—"
         lbl_vinted = ctk.CTkLabel(
             self.analysis_scroll, text=col_vinted_text,
             font=ctk.CTkFont(size=11),
-            text_color=("gray90", "gray90") if vinted_median > 0 else "gray60",
+            text_color="gray90" if vinted_median > 0 else "gray60",
             anchor="w", justify="left",
         )
         lbl_vinted.grid(row=row_idx, column=3, padx=6, pady=2, sticky="w")
         row_widgets.append(lbl_vinted)
 
-        # Colonna 4: Media venduti (mediana oggetti venduti eBay)
-        if market > 0:
-            col_sold_text = f"{market:.0f} EUR\n({sold} venduti)"
+        # Colonna 4: Media venduti eBay (riferimento di mercato)
+        if market_price > 0:
+            col_market_text = f"{market_price:.0f} EUR\n({sold_count} vend.)"
         else:
-            col_sold_text = "—"
-        lbl_sold = ctk.CTkLabel(
-            self.analysis_scroll, text=col_sold_text,
+            col_market_text = "—"
+        lbl_market = ctk.CTkLabel(
+            self.analysis_scroll, text=col_market_text,
             font=ctk.CTkFont(size=11),
-            text_color=("gray90", "gray90") if market > 0 else "gray60",
+            text_color="gray90" if market_price > 0 else "gray60",
             anchor="w", justify="left",
         )
-        lbl_sold.grid(row=row_idx, column=4, padx=6, pady=2, sticky="w")
-        row_widgets.append(lbl_sold)
+        lbl_market.grid(row=row_idx, column=4, padx=6, pady=2, sticky="w")
+        row_widgets.append(lbl_market)
 
-        # Colonna 5: Margine (% + piattaforma piu' conveniente)
-        if market > 0:
-            margin_text = f"{real_margin:+.0f}%\n{best_platform}"
+        # Colonna 5: Margine % + piattaforma piu' conveniente
+        if market_price > 0 and best_price > 0:
+            margin_text = f"{margin_percent:+.0f}%\n{best_platform}"
+            weight = "bold" if margin_percent > 0 else "normal"
         else:
             margin_text = "—"
-        margin_color = color if market > 0 else "gray60"
+            weight = "normal"
         lbl_margin = ctk.CTkLabel(
             self.analysis_scroll, text=margin_text,
-            font=ctk.CTkFont(size=11, weight="bold" if real_margin > 0 and market > 0 else "normal"),
-            text_color=margin_color, anchor="w", justify="left",
+            font=ctk.CTkFont(size=11, weight=weight),
+            text_color=color if market_price > 0 else "gray60",
+            anchor="w", justify="left",
         )
         lbl_margin.grid(row=row_idx, column=5, padx=6, pady=2, sticky="w")
         row_widgets.append(lbl_margin)
 
-        # Colonna 6: Link (alla piattaforma piu' conveniente)
+        # Colonna 6: Link al miglior annuncio
         if best_url:
-            link_label = best_platform if market > 0 and len(candidates) > 1 else "Apri"
             btn_link = ctk.CTkButton(
-                self.analysis_scroll, text=link_label,
+                self.analysis_scroll, text=best_platform,
                 width=60, height=24, corner_radius=4,
                 font=ctk.CTkFont(size=11),
                 fg_color=("gray70", "gray30"), hover_color=("gray60", "gray40"),

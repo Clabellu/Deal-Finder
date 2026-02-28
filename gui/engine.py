@@ -1,16 +1,14 @@
 """Wrapper per il motore di monitoraggio che gira in un thread separato."""
 
 import asyncio
-import random
+import statistics
 import threading
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
 import yaml
-from curl_cffi.requests import AsyncSession as CurlAsyncSession
 from dotenv import load_dotenv
 
-from analyzer.llm_parser import LLMParser
 from analyzer.price_checker import PriceChecker
 from db.database import Database
 from notifier.bot_commands import BotController
@@ -31,18 +29,6 @@ _SCRAPER_REGISTRY: dict[str, type[BaseScraper]] = {
     "vinted": VintedScraper,
 }
 
-# Vinted price lookup
-_VINTED_API_URL = "https://www.vinted.it/api/v2/catalog/items"
-_VINTED_HEADERS = {
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
-    "DNT": "1",
-    "Connection": "keep-alive",
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-origin",
-}
-
 
 class MonitorEngine:
     """Gestisce il ciclo di monitoraggio in un thread separato."""
@@ -56,8 +42,6 @@ class MonitorEngine:
         self._started_at: Optional[datetime] = None
         self._cycle_count = 0
         self._deals_found = 0
-        self._vinted_price_cache: dict[str, tuple[float, int]] = {}
-        self._vinted_session: Optional[CurlAsyncSession] = None
 
         # Callbacks per aggiornare la GUI (thread-safe tramite root.after)
         self.on_status_change: Optional[Callable[[str], None]] = None
@@ -124,120 +108,44 @@ class MonitorEngine:
 
     def _emit_analysis(
         self,
-        product_name: str,
-        asked_price: float,
-        platform: str,
-        ebay_query: str = "",
-        market_price: float = 0,
-        margin_percent: float = 0,
-        sold_count: int = 0,
-        status: str = "",
-        url: str = "",
-        active_median: float = 0,
-        active_count: int = 0,
+        keyword: str,
+        subito_median: float = 0,
+        subito_count: int = 0,
+        subito_best_url: str = "",
+        ebay_median: float = 0,
+        ebay_count: int = 0,
+        ebay_best_url: str = "",
         vinted_median: float = 0,
         vinted_count: int = 0,
+        vinted_best_url: str = "",
+        market_price: float = 0,
+        sold_count: int = 0,
+        margin_percent: float = 0,
+        best_platform: str = "—",
+        best_price: float = 0,
+        best_url: str = "",
+        status: str = "",
     ) -> None:
         if self.on_listing_analyzed:
             self.on_listing_analyzed({
-                "product_name": product_name,
-                "asked_price": asked_price,
-                "platform": platform,
-                "ebay_query": ebay_query,
-                "market_price": market_price,
-                "margin_percent": margin_percent,
-                "sold_count": sold_count,
-                "status": status,
-                "url": url,
-                "active_median": active_median,
-                "active_count": active_count,
+                "keyword": keyword,
+                "subito_median": subito_median,
+                "subito_count": subito_count,
+                "subito_best_url": subito_best_url,
+                "ebay_median": ebay_median,
+                "ebay_count": ebay_count,
+                "ebay_best_url": ebay_best_url,
                 "vinted_median": vinted_median,
                 "vinted_count": vinted_count,
+                "vinted_best_url": vinted_best_url,
+                "market_price": market_price,
+                "sold_count": sold_count,
+                "margin_percent": margin_percent,
+                "best_platform": best_platform,
+                "best_price": best_price,
+                "best_url": best_url,
+                "status": status,
             })
-
-    async def _init_vinted_session(self) -> bool:
-        """Inizializza la sessione Vinted visitando la homepage per i cookie."""
-        try:
-            self._vinted_session = CurlAsyncSession(
-                headers=_VINTED_HEADERS,
-                impersonate="chrome131",
-                timeout=30,
-            )
-            resp = await self._vinted_session.get("https://www.vinted.it/")
-            if resp.status_code == 200:
-                logger.info("Sessione Vinted inizializzata per lookup prezzi")
-                await asyncio.sleep(random.uniform(0.5, 1.5))
-                return True
-            logger.warning("Vinted homepage HTTP %d", resp.status_code)
-        except Exception as e:
-            logger.warning("Errore init sessione Vinted: %s", e)
-            self._vinted_session = None
-        return False
-
-    async def _lookup_vinted_price(self, query: str) -> tuple[float, int]:
-        """Cerca il prezzo mediano su Vinted per una query. Usa cache."""
-        cache_key = query.lower().strip()
-        if cache_key in self._vinted_price_cache:
-            return self._vinted_price_cache[cache_key]
-
-        if not self._vinted_session:
-            return (0.0, 0)
-
-        try:
-            resp = await self._vinted_session.get(_VINTED_API_URL, params={
-                "search_text": query,
-                "per_page": "20",
-                "page": "1",
-                "order": "relevance",
-                "currency": "EUR",
-            })
-            if resp.status_code == 401:
-                logger.info("Vinted sessione scaduta, reinizializzo...")
-                if await self._init_vinted_session():
-                    resp = await self._vinted_session.get(_VINTED_API_URL, params={
-                        "search_text": query,
-                        "per_page": "20",
-                        "page": "1",
-                        "order": "relevance",
-                        "currency": "EUR",
-                    })
-                else:
-                    result = (0.0, 0)
-                    self._vinted_price_cache[cache_key] = result
-                    return result
-
-            if resp.status_code != 200:
-                result = (0.0, 0)
-                self._vinted_price_cache[cache_key] = result
-                return result
-
-            data = resp.json()
-            items = data.get("items", [])
-            prices = []
-            for item in items:
-                try:
-                    p = float(str(item.get("price", "0")).replace(",", "."))
-                    if p > 0:
-                        prices.append(p)
-                except (ValueError, TypeError):
-                    continue
-
-            if prices:
-                prices.sort()
-                median = prices[len(prices) // 2]
-                result = (median, len(prices))
-                logger.info(
-                    "Vinted lookup '%s': %d prezzi (mediana %.0f)",
-                    query, len(prices), median,
-                )
-            else:
-                result = (0.0, 0)
-        except Exception as e:
-            logger.debug("Errore Vinted lookup per '%s': %s", query, e)
-            result = (0.0, 0)
-
-        self._vinted_price_cache[cache_key] = result
-        return result
 
     def _run_loop(self) -> None:
         """Entrypoint del thread: crea un event loop e avvia il ciclo async."""
@@ -287,13 +195,6 @@ class MonitorEngine:
             await db.close()
             return
 
-        llm_config = config.get("llm", {})
-        parser = LLMParser(
-            model=llm_config.get("model", "claude-haiku-4-5-20251001"),
-            max_tokens=llm_config.get("max_tokens", 500),
-            temperature=llm_config.get("temperature", 0),
-        )
-
         pricing_config = config.get("pricing", {})
         cache_hours = pricing_config.get("cache_hours", 24)
         price_checker = PriceChecker(
@@ -312,10 +213,6 @@ class MonitorEngine:
         except Exception:
             self._emit_log("Bot Telegram non avviato (continuo senza)")
 
-        # Inizializza sessione Vinted per lookup prezzi
-        await self._init_vinted_session()
-        self._vinted_price_cache.clear()
-
         polling_interval = config.get("polling_interval", 300)
 
         try:
@@ -332,7 +229,7 @@ class MonitorEngine:
                     pass
 
                 try:
-                    await self._run_cycle(config, db, scrapers, parser, price_checker, notifier, bot)
+                    await self._run_cycle(config, db, scrapers, price_checker, notifier, bot)
                     self._cycle_count += 1
                     bot.update_stats(self._cycle_count, self._deals_found)
 
@@ -353,7 +250,6 @@ class MonitorEngine:
 
                 self._emit_log(f"Ciclo {self._cycle_count} completato. Prossimo tra {polling_interval}s")
 
-                # Attendi con controllo periodico per stop
                 for _ in range(polling_interval):
                     if self._stop_event.is_set():
                         break
@@ -368,12 +264,12 @@ class MonitorEngine:
         config: dict,
         db: Database,
         scrapers: dict[str, BaseScraper],
-        parser: LLMParser,
         price_checker: PriceChecker,
         notifier: TelegramNotifier,
         bot: BotController,
     ) -> None:
-        """Esegue un singolo ciclo di scraping + analisi."""
+        """Esegue un singolo ciclo: per ogni keyword cerca su tutte le piattaforme
+        e confronta i prezzi con la media venduti eBay."""
         min_margin = config.get("min_margin_percent", 25)
         max_listings = config.get("max_listings_per_cycle", 50)
         categories = config.get("categories", [])
@@ -381,154 +277,168 @@ class MonitorEngine:
             config.get("notifications", {}).get("telegram", {}).get("include_image", True)
         )
 
-        for platform_name, scraper in scrapers.items():
-            for category in categories:
-                cat_name = category["name"]
-                keywords = category.get("keywords", [])
-                min_price = category.get("min_price", 0)
-                max_price = category.get("max_price", 99999)
+        for category in categories:
+            cat_name = category["name"]
+            keywords = category.get("keywords", [])
+            min_price = category.get("min_price", 0)
+            max_price = category.get("max_price", 99999)
 
-                for keyword in keywords:
-                    if self._stop_event.is_set() or self._paused:
-                        return
+            for keyword in keywords:
+                if self._stop_event.is_set() or self._paused:
+                    return
 
+                self._emit_log(f"Ricerca '{keyword}' su Subito, eBay e Vinted...")
+
+                # Ricerca parallela su tutte le piattaforme attive
+                search_tasks = {
+                    platform_name: asyncio.create_task(
+                        scraper.search(keyword, min_price, max_price, cat_name)
+                    )
+                    for platform_name, scraper in scrapers.items()
+                }
+
+                platform_listings: dict[str, list] = {}
+                for platform_name, task in search_tasks.items():
                     try:
-                        listings = await scraper.search(keyword, min_price, max_price, cat_name)
-                    except Exception:
-                        logger.exception("Errore scraping %s per '%s'", platform_name, keyword)
-                        continue
-
-                    listings = listings[:max_listings]
-                    self._emit_log(f"{platform_name}: {len(listings)} risultati per '{keyword}'")
-
-                    for listing in listings:
-                        if self._stop_event.is_set() or self._paused:
-                            return
-
-                        if await db.is_seen(listing.id, listing.platform):
-                            continue
-
-                        await db.mark_seen(listing.id, listing.platform)
-
-                        try:
-                            parsed = await parser.parse_listing(listing)
-                        except Exception:
-                            self._emit_analysis(
-                                listing.title, listing.price, platform_name,
-                                status="errore_llm", url=listing.url,
-                            )
-                            continue
-
-                        if parsed is None:
-                            self._emit_analysis(
-                                listing.title, listing.price, platform_name,
-                                status="skip_llm", url=listing.url,
-                            )
-                            continue
-
-                        try:
-                            price_result = await price_checker.check_price(
-                                parsed.ebay_search_query, parsed.condition
-                            )
-                        except Exception:
-                            self._emit_analysis(
-                                parsed.product_name, listing.price, platform_name,
-                                ebay_query=parsed.ebay_search_query,
-                                status="errore_prezzo", url=listing.url,
-                            )
-                            continue
-
-                        if price_result is None:
-                            self._emit_analysis(
-                                parsed.product_name, listing.price, platform_name,
-                                ebay_query=parsed.ebay_search_query,
-                                status="no_prezzo", url=listing.url,
-                            )
-                            continue
-
-                        # Lookup prezzo Vinted per confronto a 3
-                        vinted_med, vinted_cnt = 0.0, 0
-                        if listing.platform == "vinted":
-                            vinted_med = listing.price
-                            vinted_cnt = 1
-                        else:
-                            vinted_med, vinted_cnt = await self._lookup_vinted_price(
-                                parsed.ebay_search_query
-                            )
-
-                        reference_price = price_result.median_price
-                        margin = reference_price - listing.price
-                        margin_percent = (margin / listing.price * 100) if listing.price > 0 else 0
-
-                        if margin_percent < min_margin:
-                            self._emit_analysis(
-                                parsed.product_name, listing.price, platform_name,
-                                ebay_query=parsed.ebay_search_query,
-                                market_price=reference_price, margin_percent=margin_percent,
-                                sold_count=price_result.sold_count, status="sotto_soglia",
-                                url=listing.url,
-                                active_median=price_result.active_median,
-                                active_count=price_result.active_count,
-                                vinted_median=vinted_med,
-                                vinted_count=vinted_cnt,
-                            )
-                            continue
-
-                        # DEAL trovato!
-                        self._emit_analysis(
-                            parsed.product_name, listing.price, platform_name,
-                            ebay_query=parsed.ebay_search_query,
-                            market_price=reference_price, margin_percent=margin_percent,
-                            sold_count=price_result.sold_count, status="deal",
-                            url=listing.url,
-                            active_median=price_result.active_median,
-                            active_count=price_result.active_count,
-                            vinted_median=vinted_med,
-                            vinted_count=vinted_cnt,
+                        listings = await task
+                        platform_listings[platform_name] = listings[:max_listings]
+                        self._emit_log(
+                            f"{platform_name}: {len(platform_listings[platform_name])} "
+                            f"risultati per '{keyword}'"
                         )
+                    except Exception as e:
+                        logger.warning("Errore scraping %s per '%s': %s", platform_name, keyword, e)
+                        platform_listings[platform_name] = []
 
-                        try:
-                            sent = await notifier.send_deal(
-                                product_name=parsed.product_name,
-                                asked_price=listing.price,
-                                median_price=price_result.median_price,
-                                margin=margin,
-                                margin_percent=margin_percent,
-                                min_price=price_result.min_price,
-                                max_price=price_result.max_price,
-                                sold_count=price_result.sold_count,
-                                key_details=parsed.key_details,
-                                location=listing.location,
-                                platform=listing.platform,
-                                url=listing.url,
-                                image_url=listing.image_url,
-                                include_image=include_image,
-                            )
-                        except Exception:
-                            sent = False
+                # Calcola mediana e miglior annuncio per ogni piattaforma
+                def platform_stats(listings):
+                    valid = [l for l in listings if l.price > 0]
+                    if not valid:
+                        return 0.0, 0, 0.0, ""
+                    prices = sorted(l.price for l in valid)
+                    med = statistics.median(prices)
+                    best = min(valid, key=lambda l: l.price)
+                    return float(med), len(valid), best.price, best.url
 
-                        if sent:
-                            await db.mark_seen(listing.id, listing.platform, notified=True)
-                            await db.save_notification(
-                                listing_id=listing.id,
-                                platform=listing.platform,
-                                product_name=parsed.product_name,
-                                asked_price=listing.price,
-                                market_price=price_result.median_price,
-                                margin_percent=margin_percent,
-                            )
-                            self._deals_found += 1
-                            self._emit_log(
-                                f"DEAL! {parsed.product_name}: "
-                                f"{listing.price:.0f}EUR -> mercato {reference_price:.0f}EUR "
-                                f"(+{margin_percent:.0f}%)"
-                            )
-                            if self.on_deal_found:
-                                self.on_deal_found({
-                                    "product_name": parsed.product_name,
-                                    "asked_price": listing.price,
-                                    "market_price": reference_price,
-                                    "margin_percent": margin_percent,
-                                    "platform": listing.platform,
-                                    "url": listing.url,
-                                })
+                sub_med, sub_cnt, sub_best_p, sub_best_url = platform_stats(
+                    platform_listings.get("subito", [])
+                )
+                eby_med, eby_cnt, eby_best_p, eby_best_url = platform_stats(
+                    platform_listings.get("ebay", [])
+                )
+                vnt_med, vnt_cnt, vnt_best_p, vnt_best_url = platform_stats(
+                    platform_listings.get("vinted", [])
+                )
+
+                # Media prezzi venduti su eBay (riferimento di mercato)
+                try:
+                    price_result = await price_checker.check_price(keyword, "")
+                    market_price = price_result.median_price if price_result else 0.0
+                    sold_count = price_result.sold_count if price_result else 0
+                except Exception as e:
+                    logger.warning("Errore price check '%s': %s", keyword, e)
+                    price_result = None
+                    market_price, sold_count = 0.0, 0
+
+                # Trova il prezzo e la piattaforma migliore tra le 3
+                candidates = [
+                    (sub_best_p, "Subito", sub_best_url),
+                    (eby_best_p, "eBay", eby_best_url),
+                    (vnt_best_p, "Vinted", vnt_best_url),
+                ]
+                valid_candidates = [(p, pl, u) for p, pl, u in candidates if p > 0 and u]
+
+                if not valid_candidates:
+                    self._emit_analysis(
+                        keyword=keyword,
+                        subito_median=sub_med, subito_count=sub_cnt,
+                        ebay_median=eby_med, ebay_count=eby_cnt,
+                        vinted_median=vnt_med, vinted_count=vnt_cnt,
+                        market_price=market_price, sold_count=sold_count,
+                        status="no_prezzo",
+                    )
+                    continue
+
+                best_price, best_platform, best_url = min(valid_candidates, key=lambda x: x[0])
+
+                if market_price > 0:
+                    margin_percent = (market_price - best_price) / best_price * 100
+                    status = "deal" if margin_percent >= min_margin else "sotto_soglia"
+                else:
+                    margin_percent = 0.0
+                    status = "no_prezzo"
+
+                self._emit_analysis(
+                    keyword=keyword,
+                    subito_median=sub_med, subito_count=sub_cnt, subito_best_url=sub_best_url,
+                    ebay_median=eby_med, ebay_count=eby_cnt, ebay_best_url=eby_best_url,
+                    vinted_median=vnt_med, vinted_count=vnt_cnt, vinted_best_url=vnt_best_url,
+                    market_price=market_price, sold_count=sold_count,
+                    margin_percent=margin_percent,
+                    best_platform=best_platform, best_price=best_price, best_url=best_url,
+                    status=status,
+                )
+
+                if status != "deal":
+                    continue
+
+                # DEAL trovato!
+                self._deals_found += 1
+                self._emit_log(
+                    f"DEAL! '{keyword}': {best_price:.0f}EUR su {best_platform} "
+                    f"(mercato {market_price:.0f}EUR, +{margin_percent:.0f}%)"
+                )
+
+                if self.on_deal_found:
+                    self.on_deal_found({
+                        "product_name": keyword,
+                        "asked_price": best_price,
+                        "market_price": market_price,
+                        "margin_percent": margin_percent,
+                        "platform": best_platform,
+                        "url": best_url,
+                    })
+
+                # Trova immagine dal miglior annuncio per la notifica Telegram
+                best_listings = platform_listings.get(best_platform.lower(), [])
+                best_listing_obj = (
+                    min(best_listings, key=lambda l: l.price) if best_listings else None
+                )
+                image_url = best_listing_obj.image_url if best_listing_obj else None
+                location = best_listing_obj.location if best_listing_obj else None
+
+                summary = (
+                    f"Subito: {sub_med:.0f}€ ({sub_cnt}) | "
+                    f"eBay: {eby_med:.0f}€ ({eby_cnt}) | "
+                    f"Vinted: {vnt_med:.0f}€ ({vnt_cnt})"
+                )
+
+                try:
+                    sent = await notifier.send_deal(
+                        product_name=keyword,
+                        asked_price=best_price,
+                        median_price=market_price,
+                        margin=market_price - best_price,
+                        margin_percent=margin_percent,
+                        min_price=price_result.min_price if price_result else 0,
+                        max_price=price_result.max_price if price_result else 0,
+                        sold_count=sold_count,
+                        key_details=summary,
+                        location=location,
+                        platform=best_platform,
+                        url=best_url,
+                        image_url=image_url,
+                        include_image=include_image,
+                    )
+                except Exception:
+                    sent = False
+
+                if sent:
+                    await db.save_notification(
+                        listing_id=keyword,
+                        platform=best_platform.lower(),
+                        product_name=keyword,
+                        asked_price=best_price,
+                        market_price=market_price,
+                        margin_percent=margin_percent,
+                    )
