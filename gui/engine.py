@@ -1,7 +1,6 @@
 """Wrapper per il motore di monitoraggio che gira in un thread separato."""
 
 import asyncio
-import statistics
 import threading
 from datetime import datetime, timezone
 from typing import Callable, Optional
@@ -10,6 +9,7 @@ from urllib.parse import quote_plus
 import yaml
 from dotenv import load_dotenv
 
+from analyzer.llm_parser import LLMParser
 from analyzer.price_checker import PriceChecker
 from db.database import Database
 from notifier.bot_commands import BotController
@@ -28,6 +28,8 @@ _SCRAPER_REGISTRY: dict[str, type[BaseScraper]] = {
     "subito": SubitoScraper,
     "vinted": VintedScraper,
 }
+
+_MAX_LLM_CHECKS = 10  # annunci da verificare col LLM per piattaforma
 
 
 class MonitorEngine:
@@ -208,6 +210,20 @@ class MonitorEngine:
             cache_ttl=cache_hours * 3600,
         )
 
+        # Inizializza LLM parser (filtra annunci irrilevanti)
+        llm_config = config.get("llm", {})
+        parser: Optional[LLMParser] = None
+        try:
+            parser = LLMParser(
+                model=llm_config.get("model", "claude-haiku-4-5-20251001"),
+                max_tokens=llm_config.get("max_tokens", 500),
+                temperature=llm_config.get("temperature", 0),
+            )
+            self._emit_log("LLM attivo: filtro annunci + query eBay specifica")
+        except Exception as e:
+            self._emit_log(f"LLM non disponibile: {e}")
+            self._emit_log("Senza LLM i risultati saranno meno precisi")
+
         notifier = TelegramNotifier()
         bot = BotController(db)
 
@@ -232,7 +248,9 @@ class MonitorEngine:
                     pass
 
                 try:
-                    await self._run_cycle(config, db, scrapers, price_checker, notifier, bot)
+                    await self._run_cycle(
+                        config, db, scrapers, parser, price_checker, notifier, bot,
+                    )
                     self._cycle_count += 1
                     bot.update_stats(self._cycle_count, self._deals_found)
 
@@ -262,19 +280,61 @@ class MonitorEngine:
             await db.close()
             self._emit_log("Motore fermato")
 
+    # ------------------------------------------------------------------ #
+    #  LLM: trova il miglior annuncio valido per piattaforma              #
+    # ------------------------------------------------------------------ #
+
+    async def _find_best_valid_listing(
+        self,
+        parser: LLMParser,
+        listings: list,
+        max_checks: int = _MAX_LLM_CHECKS,
+    ):
+        """Trova l'annuncio valido piu' economico usando il filtro LLM.
+
+        Ordina per prezzo crescente e analizza i piu' economici finche'
+        il LLM non conferma che e' un prodotto valido e rivendibile.
+        Scarta giochi, accessori, ricambi, lotti, annunci vaghi.
+
+        Returns:
+            (listing, ParsedProduct) oppure None.
+        """
+        sorted_listings = sorted(listings, key=lambda l: l.price)
+        for listing in sorted_listings[:max_checks]:
+            try:
+                parsed = await parser.parse_listing(listing)
+                if parsed:
+                    return listing, parsed
+            except Exception:
+                logger.debug("Errore LLM per listing %s", listing.id, exc_info=True)
+        return None
+
+    # ------------------------------------------------------------------ #
+    #  Ciclo principale                                                    #
+    # ------------------------------------------------------------------ #
+
     async def _run_cycle(
         self,
         config: dict,
         db: Database,
         scrapers: dict[str, BaseScraper],
+        parser: Optional[LLMParser],
         price_checker: PriceChecker,
         notifier: TelegramNotifier,
         bot: BotController,
     ) -> None:
-        """Esegue un singolo ciclo: per ogni keyword cerca su tutte le piattaforme
-        e confronta i prezzi con la media venduti eBay."""
+        """Esegue un singolo ciclo: cerca -> LLM filtra -> price check specifico -> margine.
+
+        Flusso per ogni keyword:
+        1. Cerca su Subito e Vinted (parallelo)
+        2. LLM analizza i piu' economici per identificare il prodotto reale
+        3. PriceChecker cerca su eBay con la query specifica del LLM
+        4. Confronta prezzo migliore vs media venduti eBay
+        5. Se margine >= soglia -> DEAL con link
+        """
         min_margin = config.get("min_margin_percent", 25)
         max_listings = config.get("max_listings_per_cycle", 50)
+        max_llm_checks = config.get("max_llm_checks_per_keyword", _MAX_LLM_CHECKS)
         categories = config.get("categories", [])
         include_image = (
             config.get("notifications", {}).get("telegram", {}).get("include_image", True)
@@ -290,17 +350,15 @@ class MonitorEngine:
                 if self._stop_event.is_set() or self._paused:
                     return
 
-                self._emit_log(f"Ricerca '{keyword}' su Subito, eBay e Vinted...")
+                self._emit_log(f"Ricerca '{keyword}'...")
 
-                # Ricerca parallela: Subito/Vinted via scraper, eBay via PriceChecker
+                # --- 1. Cerca su Subito e Vinted in parallelo ---
                 search_tasks = {
                     platform_name: asyncio.create_task(
                         scraper.search(keyword, min_price, max_price, cat_name)
                     )
                     for platform_name, scraper in scrapers.items()
                 }
-                # eBay: PriceChecker (web scraping, no rate limit API)
-                price_task = asyncio.create_task(price_checker.check_price(keyword, ""))
 
                 platform_listings: dict[str, list] = {}
                 for platform_name, task in search_tasks.items():
@@ -315,31 +373,69 @@ class MonitorEngine:
                         logger.warning("Errore scraping %s per '%s': %s", platform_name, keyword, e)
                         platform_listings[platform_name] = []
 
-                # Risultato PriceChecker (eBay venduti + attivi via scraping)
+                # --- 2. Trova il miglior annuncio valido per piattaforma ---
+                ebay_query = keyword  # default, il LLM lo raffina
+                best_per_platform: dict[str, dict] = {}
+
+                if parser:
+                    # Con LLM: filtra annunci irrilevanti (giochi, accessori, ricambi)
+                    for platform_name, listings in platform_listings.items():
+                        if not listings:
+                            continue
+                        result = await self._find_best_valid_listing(
+                            parser, listings, max_llm_checks,
+                        )
+                        if result:
+                            listing, parsed = result
+                            best_per_platform[platform_name] = {
+                                "price": listing.price,
+                                "url": listing.url,
+                                "listing": listing,
+                                "parsed": parsed,
+                            }
+                            # Prima query LLM valida -> usala per PriceChecker
+                            if ebay_query == keyword:
+                                ebay_query = parsed.ebay_search_query
+                            self._emit_log(
+                                f"{platform_name}: '{parsed.product_name}' "
+                                f"a {listing.price:.0f}EUR"
+                            )
+                        else:
+                            self._emit_log(
+                                f"{platform_name}: nessun annuncio valido per '{keyword}'"
+                            )
+                else:
+                    # Senza LLM: usa l'annuncio piu' economico (meno preciso)
+                    for platform_name, listings in platform_listings.items():
+                        valid = [l for l in listings if l.price > 0]
+                        if valid:
+                            best = min(valid, key=lambda l: l.price)
+                            best_per_platform[platform_name] = {
+                                "price": best.price,
+                                "url": best.url,
+                                "listing": best,
+                                "parsed": None,
+                            }
+
+                # --- 3. eBay prices via PriceChecker (query LLM-specifica) ---
                 try:
-                    price_result = await price_task
+                    price_result = await price_checker.check_price(ebay_query, "")
                 except Exception as e:
-                    logger.warning("Errore price check '%s': %s", keyword, e)
+                    logger.warning("Errore price check '%s': %s", ebay_query, e)
                     price_result = None
 
-                # Calcola mediana e miglior annuncio per Subito e Vinted
-                def platform_stats(listings):
-                    valid = [l for l in listings if l.price > 0]
-                    if not valid:
-                        return 0.0, 0, 0.0, ""
-                    prices = sorted(l.price for l in valid)
-                    med = statistics.median(prices)
-                    best = min(valid, key=lambda l: l.price)
-                    return float(med), len(valid), best.price, best.url
+                # --- 4. Statistiche per la GUI ---
+                sub = best_per_platform.get("subito", {})
+                vnt = best_per_platform.get("vinted", {})
 
-                sub_med, sub_cnt, sub_best_p, sub_best_url = platform_stats(
-                    platform_listings.get("subito", [])
-                )
-                vnt_med, vnt_cnt, vnt_best_p, vnt_best_url = platform_stats(
-                    platform_listings.get("vinted", [])
-                )
+                sub_best_p = sub.get("price", 0.0)
+                sub_best_url = sub.get("url", "")
+                sub_cnt = len(platform_listings.get("subito", []))
 
-                # eBay dati dal PriceChecker (web scraping, funziona sempre)
+                vnt_best_p = vnt.get("price", 0.0)
+                vnt_best_url = vnt.get("url", "")
+                vnt_cnt = len(platform_listings.get("vinted", []))
+
                 if price_result:
                     eby_med = price_result.active_median
                     eby_cnt = price_result.active_count
@@ -347,20 +443,20 @@ class MonitorEngine:
                     sold_count = price_result.sold_count
                     self._emit_log(
                         f"ebay: {eby_cnt} attivi (med. {eby_med:.0f}EUR), "
-                        f"{sold_count} venduti (med. {market_price:.0f}EUR) per '{keyword}'"
+                        f"{sold_count} venduti (med. {market_price:.0f}EUR) "
+                        f"per '{ebay_query}'"
                     )
                 else:
                     eby_med, eby_cnt = 0.0, 0
                     market_price, sold_count = 0.0, 0
 
-                # URL di ricerca eBay (non abbiamo singoli annunci)
                 eby_best_url = (
-                    f"https://www.ebay.it/sch/i.html?_nkw={quote_plus(keyword)}&LH_BIN=1"
+                    f"https://www.ebay.it/sch/i.html?_nkw={quote_plus(ebay_query)}&LH_BIN=1"
                     if eby_med > 0 else ""
                 )
                 eby_best_p = price_result.min_price if price_result and eby_med > 0 else 0.0
 
-                # Trova il prezzo e la piattaforma migliore tra le 3
+                # --- 5. Trova il miglior deal tra tutte le piattaforme ---
                 candidates = [
                     (sub_best_p, "Subito", sub_best_url),
                     (eby_best_p, "eBay", eby_best_url),
@@ -371,9 +467,9 @@ class MonitorEngine:
                 if not valid_candidates:
                     self._emit_analysis(
                         keyword=keyword,
-                        subito_median=sub_med, subito_count=sub_cnt,
+                        subito_median=sub_best_p, subito_count=sub_cnt,
                         ebay_median=eby_med, ebay_count=eby_cnt,
-                        vinted_median=vnt_med, vinted_count=vnt_cnt,
+                        vinted_median=vnt_best_p, vinted_count=vnt_cnt,
                         market_price=market_price, sold_count=sold_count,
                         status="no_prezzo",
                     )
@@ -390,9 +486,9 @@ class MonitorEngine:
 
                 self._emit_analysis(
                     keyword=keyword,
-                    subito_median=sub_med, subito_count=sub_cnt, subito_best_url=sub_best_url,
+                    subito_median=sub_best_p, subito_count=sub_cnt, subito_best_url=sub_best_url,
                     ebay_median=eby_med, ebay_count=eby_cnt, ebay_best_url=eby_best_url,
-                    vinted_median=vnt_med, vinted_count=vnt_cnt, vinted_best_url=vnt_best_url,
+                    vinted_median=vnt_best_p, vinted_count=vnt_cnt, vinted_best_url=vnt_best_url,
                     market_price=market_price, sold_count=sold_count,
                     margin_percent=margin_percent,
                     best_platform=best_platform, best_price=best_price, best_url=best_url,
@@ -402,16 +498,21 @@ class MonitorEngine:
                 if status != "deal":
                     continue
 
-                # DEAL trovato!
+                # --- DEAL trovato! ---
                 self._deals_found += 1
+                best_data = best_per_platform.get(best_platform.lower(), {})
+                best_listing_obj = best_data.get("listing")
+                best_parsed = best_data.get("parsed")
+                product_name = best_parsed.product_name if best_parsed else keyword
+
                 self._emit_log(
-                    f"DEAL! '{keyword}': {best_price:.0f}EUR su {best_platform} "
+                    f"DEAL! '{product_name}': {best_price:.0f}EUR su {best_platform} "
                     f"(mercato {market_price:.0f}EUR, +{margin_percent:.0f}%)"
                 )
 
                 if self.on_deal_found:
                     self.on_deal_found({
-                        "product_name": keyword,
+                        "product_name": product_name,
                         "asked_price": best_price,
                         "market_price": market_price,
                         "margin_percent": margin_percent,
@@ -419,23 +520,22 @@ class MonitorEngine:
                         "url": best_url,
                     })
 
-                # Trova immagine dal miglior annuncio per la notifica Telegram
-                best_listings = platform_listings.get(best_platform.lower(), [])
-                best_listing_obj = (
-                    min(best_listings, key=lambda l: l.price) if best_listings else None
-                )
+                # Dettagli per notifica Telegram
                 image_url = best_listing_obj.image_url if best_listing_obj else None
                 location = best_listing_obj.location if best_listing_obj else None
+                key_details = best_parsed.key_details if best_parsed else ""
 
                 summary = (
-                    f"Subito: {sub_med:.0f}€ ({sub_cnt}) | "
+                    f"Subito: {sub_best_p:.0f}€ ({sub_cnt}) | "
                     f"eBay: {eby_med:.0f}€ ({eby_cnt}) | "
-                    f"Vinted: {vnt_med:.0f}€ ({vnt_cnt})"
+                    f"Vinted: {vnt_best_p:.0f}€ ({vnt_cnt})"
                 )
+                if key_details:
+                    summary = f"{key_details}\n{summary}"
 
                 try:
                     sent = await notifier.send_deal(
-                        product_name=keyword,
+                        product_name=product_name,
                         asked_price=best_price,
                         median_price=market_price,
                         margin=market_price - best_price,
@@ -455,9 +555,9 @@ class MonitorEngine:
 
                 if sent:
                     await db.save_notification(
-                        listing_id=keyword,
+                        listing_id=best_listing_obj.id if best_listing_obj else keyword,
                         platform=best_platform.lower(),
-                        product_name=keyword,
+                        product_name=product_name,
                         asked_price=best_price,
                         market_price=market_price,
                         margin_percent=margin_percent,

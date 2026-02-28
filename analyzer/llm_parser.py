@@ -65,7 +65,7 @@ class LLMParser:
         api_key = os.environ.get("ANTHROPIC_API_KEY")
         if not api_key:
             raise ValueError("ANTHROPIC_API_KEY non impostata nell'ambiente")
-        self._client = anthropic.Anthropic(api_key=api_key)
+        self._client = anthropic.AsyncAnthropic(api_key=api_key)
         self._model = model
         self._max_tokens = max_tokens
         self._temperature = temperature
@@ -85,8 +85,7 @@ class LLMParser:
         )
 
         try:
-            # L'SDK Anthropic e' sincrono, lo usiamo direttamente
-            response = self._client.messages.create(
+            response = await self._client.messages.create(
                 model=self._model,
                 max_tokens=self._max_tokens,
                 temperature=self._temperature,
