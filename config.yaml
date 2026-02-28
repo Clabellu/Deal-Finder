@@ -16,14 +16,6 @@ platforms:
 
 # Categorie da monitorare
 categories:
-  - name: "Smartphone"
-    keywords:
-      - "iphone"
-      - "samsung galaxy"
-      - "pixel"
-    min_price: 50
-    max_price: 1200
-
   - name: "Console"
     keywords:
       - "ps5"

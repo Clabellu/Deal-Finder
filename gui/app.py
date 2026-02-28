@@ -244,16 +244,16 @@ class DealFinderApp(ctk.CTk):
             dot.pack(side="left", padx=(0, 2))
             ctk.CTkLabel(legend, text=text, text_color="gray60", font=ctk.CTkFont(size=11)).pack(side="left", padx=(0, 12))
 
-        # Tabella analisi — 6 colonne
+        # Tabella analisi — 7 colonne
         self.analysis_scroll = ctk.CTkScrollableFrame(frame)
         self.analysis_scroll.pack(fill="both", expand=True)
 
-        # Colonne: Annuncio | eBay | Vinted | Media venduti | Margine | Link
-        col_weights = [3, 2, 2, 2, 2, 1]
+        # Colonne: Prodotto | Subito | eBay | Vinted | Media venduti | Margine | Link
+        col_weights = [3, 1, 2, 2, 2, 2, 1]
         for i, w in enumerate(col_weights):
             self.analysis_scroll.columnconfigure(i, weight=w)
 
-        headers = ["Annuncio", "Prezzo eBay", "Prezzo Vinted", "Media venduti", "Margine", "Link"]
+        headers = ["Prodotto", "Prezzo Subito", "Prezzo eBay", "Prezzo Vinted", "Media venduti", "Margine", "Link"]
         for i, h in enumerate(headers):
             ctk.CTkLabel(
                 self.analysis_scroll, text=h,
@@ -331,59 +331,72 @@ class DealFinderApp(ctk.CTk):
 
         row_widgets: list[tk.Widget] = []
 
-        # Colonna 1: Annuncio (piattaforma sorgente + prodotto + prezzo)
-        col1_text = f"[{platform}] {product}\n{asked:.0f} EUR"
-        lbl_source = ctk.CTkLabel(
-            self.analysis_scroll, text=col1_text,
+        # Colonna 0: Nome Prodotto (solo nome, senza platform e prezzo)
+        lbl_product = ctk.CTkLabel(
+            self.analysis_scroll, text=product,
             font=ctk.CTkFont(size=11), text_color=color, anchor="w", justify="left",
         )
-        lbl_source.grid(row=row_idx, column=0, padx=6, pady=2, sticky="w")
-        row_widgets.append(lbl_source)
+        lbl_product.grid(row=row_idx, column=0, padx=6, pady=2, sticky="w")
+        row_widgets.append(lbl_product)
+
+        # Colonna 1: Prezzo Subito (prezzo annuncio se proviene da Subito)
+        if data.get("platform", "").lower() == "subito" and asked > 0:
+            col_subito_text = f"{asked:.0f} EUR"
+        else:
+            col_subito_text = "—"
+        lbl_subito = ctk.CTkLabel(
+            self.analysis_scroll, text=col_subito_text,
+            font=ctk.CTkFont(size=11),
+            text_color=color if col_subito_text != "—" else "gray60",
+            anchor="w", justify="left",
+        )
+        lbl_subito.grid(row=row_idx, column=1, padx=6, pady=2, sticky="w")
+        row_widgets.append(lbl_subito)
 
         # Colonna 2: Prezzo eBay (inserzioni attive)
         if active_median > 0:
-            col2_text = f"{active_median:.0f} EUR\n({active_count} attivi)"
+            col_ebay_text = f"{active_median:.0f} EUR\n({active_count} attivi)"
         else:
             error_labels = {
                 "no_prezzo": "Non trovato", "errore_prezzo": "Errore",
                 "skip_llm": "—", "errore_llm": "—",
             }
-            col2_text = error_labels.get(status, "—")
+            col_ebay_text = error_labels.get(status, "—")
         lbl_ebay = ctk.CTkLabel(
-            self.analysis_scroll, text=col2_text,
+            self.analysis_scroll, text=col_ebay_text,
             font=ctk.CTkFont(size=11),
             text_color=("gray90", "gray90") if active_median > 0 else "gray60",
             anchor="w", justify="left",
         )
-        lbl_ebay.grid(row=row_idx, column=1, padx=6, pady=2, sticky="w")
+        lbl_ebay.grid(row=row_idx, column=2, padx=6, pady=2, sticky="w")
         row_widgets.append(lbl_ebay)
 
         # Colonna 3: Prezzo Vinted
         if vinted_median > 0:
-            col3_text = f"{vinted_median:.0f} EUR\n({vinted_count} annunci)"
+            col_vinted_text = f"{vinted_median:.0f} EUR\n({vinted_count} annunci)"
         else:
-            col3_text = "—"
+            col_vinted_text = "—"
         lbl_vinted = ctk.CTkLabel(
-            self.analysis_scroll, text=col3_text,
+            self.analysis_scroll, text=col_vinted_text,
             font=ctk.CTkFont(size=11),
             text_color=("gray90", "gray90") if vinted_median > 0 else "gray60",
             anchor="w", justify="left",
         )
-        lbl_vinted.grid(row=row_idx, column=2, padx=6, pady=2, sticky="w")
+        lbl_vinted.grid(row=row_idx, column=3, padx=6, pady=2, sticky="w")
         row_widgets.append(lbl_vinted)
 
         # Colonna 4: Media venduti (mediana oggetti venduti eBay)
         if market > 0:
-            col4_text = f"{market:.0f} EUR\n({sold} venduti)"
+            col_sold_text = f"{market:.0f} EUR\n({sold} venduti)"
         else:
-            col4_text = "—"
+            col_sold_text = "—"
         lbl_sold = ctk.CTkLabel(
-            self.analysis_scroll, text=col4_text,
+            self.analysis_scroll, text=col_sold_text,
             font=ctk.CTkFont(size=11),
             text_color=("gray90", "gray90") if market > 0 else "gray60",
             anchor="w", justify="left",
         )
-        lbl_sold.grid(row=row_idx, column=3, padx=6, pady=2, sticky="w")
+        lbl_sold.grid(row=row_idx, column=4, padx=6, pady=2, sticky="w")
         row_widgets.append(lbl_sold)
 
         # Colonna 5: Margine (% + piattaforma piu' conveniente)
@@ -397,7 +410,7 @@ class DealFinderApp(ctk.CTk):
             font=ctk.CTkFont(size=11, weight="bold" if real_margin > 0 and market > 0 else "normal"),
             text_color=margin_color, anchor="w", justify="left",
         )
-        lbl_margin.grid(row=row_idx, column=4, padx=6, pady=2, sticky="w")
+        lbl_margin.grid(row=row_idx, column=5, padx=6, pady=2, sticky="w")
         row_widgets.append(lbl_margin)
 
         # Colonna 6: Link (alla piattaforma piu' conveniente)
@@ -410,14 +423,14 @@ class DealFinderApp(ctk.CTk):
                 fg_color=("gray70", "gray30"), hover_color=("gray60", "gray40"),
                 command=lambda u=best_url: webbrowser.open(u),
             )
-            btn_link.grid(row=row_idx, column=5, padx=6, pady=2, sticky="w")
+            btn_link.grid(row=row_idx, column=6, padx=6, pady=2, sticky="w")
             row_widgets.append(btn_link)
         else:
             lbl_no_link = ctk.CTkLabel(
                 self.analysis_scroll, text="—",
                 font=ctk.CTkFont(size=11), text_color="gray60",
             )
-            lbl_no_link.grid(row=row_idx, column=5, padx=6, pady=2, sticky="w")
+            lbl_no_link.grid(row=row_idx, column=6, padx=6, pady=2, sticky="w")
             row_widgets.append(lbl_no_link)
 
         self._analysis_rows.append(row_widgets)
