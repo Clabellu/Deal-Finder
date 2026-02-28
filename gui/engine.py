@@ -5,6 +5,7 @@ import statistics
 import threading
 from datetime import datetime, timezone
 from typing import Callable, Optional
+from urllib.parse import quote_plus
 
 import yaml
 from dotenv import load_dotenv
@@ -15,7 +16,6 @@ from notifier.bot_commands import BotController
 from notifier.telegram_bot import TelegramNotifier
 from scrapers.base_scraper import BaseScraper
 from scrapers.subito import SubitoScraper
-from scrapers.ebay import EbayScraper
 from scrapers.vinted import VintedScraper
 from utils.logger import get_logger
 
@@ -23,9 +23,9 @@ load_dotenv()
 
 logger = get_logger("engine")
 
+# eBay non usa scraper (rate limit API), usa PriceChecker (web scraping)
 _SCRAPER_REGISTRY: dict[str, type[BaseScraper]] = {
     "subito": SubitoScraper,
-    "ebay": EbayScraper,
     "vinted": VintedScraper,
 }
 
@@ -189,8 +189,11 @@ class MonitorEngine:
             if scraper_cls:
                 scrapers[platform] = scraper_cls()
                 self._emit_log(f"Scraper attivato: {platform}")
+        # eBay usa PriceChecker (web scraping) invece dell'API (rate limited)
+        if "ebay" in active_platforms:
+            self._emit_log("eBay: dati da PriceChecker (web scraping)")
 
-        if not scrapers:
+        if not scrapers and "ebay" not in active_platforms:
             self._emit_log("Nessuno scraper attivo!")
             await db.close()
             return
@@ -289,13 +292,15 @@ class MonitorEngine:
 
                 self._emit_log(f"Ricerca '{keyword}' su Subito, eBay e Vinted...")
 
-                # Ricerca parallela su tutte le piattaforme attive
+                # Ricerca parallela: Subito/Vinted via scraper, eBay via PriceChecker
                 search_tasks = {
                     platform_name: asyncio.create_task(
                         scraper.search(keyword, min_price, max_price, cat_name)
                     )
                     for platform_name, scraper in scrapers.items()
                 }
+                # eBay: PriceChecker (web scraping, no rate limit API)
+                price_task = asyncio.create_task(price_checker.check_price(keyword, ""))
 
                 platform_listings: dict[str, list] = {}
                 for platform_name, task in search_tasks.items():
@@ -310,7 +315,14 @@ class MonitorEngine:
                         logger.warning("Errore scraping %s per '%s': %s", platform_name, keyword, e)
                         platform_listings[platform_name] = []
 
-                # Calcola mediana e miglior annuncio per ogni piattaforma
+                # Risultato PriceChecker (eBay venduti + attivi via scraping)
+                try:
+                    price_result = await price_task
+                except Exception as e:
+                    logger.warning("Errore price check '%s': %s", keyword, e)
+                    price_result = None
+
+                # Calcola mediana e miglior annuncio per Subito e Vinted
                 def platform_stats(listings):
                     valid = [l for l in listings if l.price > 0]
                     if not valid:
@@ -323,22 +335,30 @@ class MonitorEngine:
                 sub_med, sub_cnt, sub_best_p, sub_best_url = platform_stats(
                     platform_listings.get("subito", [])
                 )
-                eby_med, eby_cnt, eby_best_p, eby_best_url = platform_stats(
-                    platform_listings.get("ebay", [])
-                )
                 vnt_med, vnt_cnt, vnt_best_p, vnt_best_url = platform_stats(
                     platform_listings.get("vinted", [])
                 )
 
-                # Media prezzi venduti su eBay (riferimento di mercato)
-                try:
-                    price_result = await price_checker.check_price(keyword, "")
-                    market_price = price_result.median_price if price_result else 0.0
-                    sold_count = price_result.sold_count if price_result else 0
-                except Exception as e:
-                    logger.warning("Errore price check '%s': %s", keyword, e)
-                    price_result = None
+                # eBay dati dal PriceChecker (web scraping, funziona sempre)
+                if price_result:
+                    eby_med = price_result.active_median
+                    eby_cnt = price_result.active_count
+                    market_price = price_result.median_price
+                    sold_count = price_result.sold_count
+                    self._emit_log(
+                        f"ebay: {eby_cnt} attivi (med. {eby_med:.0f}EUR), "
+                        f"{sold_count} venduti (med. {market_price:.0f}EUR) per '{keyword}'"
+                    )
+                else:
+                    eby_med, eby_cnt = 0.0, 0
                     market_price, sold_count = 0.0, 0
+
+                # URL di ricerca eBay (non abbiamo singoli annunci)
+                eby_best_url = (
+                    f"https://www.ebay.it/sch/i.html?_nkw={quote_plus(keyword)}&LH_BIN=1"
+                    if eby_med > 0 else ""
+                )
+                eby_best_p = price_result.min_price if price_result and eby_med > 0 else 0.0
 
                 # Trova il prezzo e la piattaforma migliore tra le 3
                 candidates = [
